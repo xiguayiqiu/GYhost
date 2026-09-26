@@ -1,11 +1,22 @@
+<p align="center">
+  <img src="app.png" alt="GYhost" width="160">
+</p>
+
 # GYhost
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Go-1.27.1-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.27.1">
+  <img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square" alt="License: Apache 2.0">
+  <img src="https://img.shields.io/badge/CUDA-optional-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA: optional">
+  <img src="https://img.shields.io/badge/Platform-Windows_%7C_Linux_%7C_macOS_%7C_Termux-informational?style=flat-square" alt="Platforms: Windows / Linux / macOS / Termux">
+</p>
 
 GYhost 是一个**以本地为核心**的安全工具集，使用 Go 语言开发，专注于本地离线的安全分析能力。
 
 > 定位：本地优先（local-first）。目标覆盖 hash 破解、pwn 测试、本地 fuzz 等本地安全场景，
 > **当前仅落地了 hash 相关模块**，其余能力在规划中。
 
-[GYscan](www.github.com/xiguayiqiu/GYscan)、[JYscan](www.github.com/xiguayiqiu/JYscan)、[GYhost](www.github/xiguayiqiu/GYhost)其中`GYhost`是GY系列的本地分析工具
+[GYscan](https://github.com/xiguayiqiu/GYscan)、[JYscan](https://github.com/xiguayiqiu/JYscan)、[GYhost](https://github.com/xiguayiqiu/GYhost) —— 其中 `GYhost` 是 GY 系列的本地分析工具。
 
 ## 设计理念
 
@@ -206,6 +217,10 @@ make test-gpu  # CUDA 构建下的测试（无 GPU 时自动跳过用例）
 make vet       # 静态检查（CPU/CUDA 两种构建形态）
 make fmt       # 列出未 gofmt 的文件（应为空）
 ```
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
 
 ## 免责声明
 
