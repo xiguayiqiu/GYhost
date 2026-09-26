@@ -5,6 +5,8 @@ GYhost 是一个**以本地为核心**的安全工具集，使用 Go 语言开�
 > 定位：本地优先（local-first）。目标覆盖 hash 破解、pwn 测试、本地 fuzz 等本地安全场景，
 > **当前仅落地了 hash 相关模块**，其余能力在规划中。
 
+[GYscan](www.github.com/xiguayiqiu/GYscan)、[JYscan](www.github.com/xiguayiqiu/JYscan)、[GYhost](www.github/xiguayiqiu/GYhost)其中`GYhost`是GY系列的本地分析工具
+
 ## 设计理念
 
 - **本地优先**：所有分析在本地离线完成，不依赖在线服务，数据不出本机。
