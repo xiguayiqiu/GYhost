@@ -20,8 +20,7 @@
 /dist/
 
 # CUDA 静态库与编译中间目标文件
-# 由 internal/cuda/Makefile 生成（cuda.o -> libgyhost_cuda.a），
-# cuda_kernel/ 与 freeclient 下的同名产物同理
+# 由 internal/cuda/Makefile 生成（cuda.o -> libgyhost_cuda.a）
 *.o
 *.a
 
@@ -60,6 +59,9 @@ coverage.*
 
 # freeclient 是另一个独立 Go 模块（自带 go.mod），与 GYhost 无关
 /freeclient/
+
+# cuda_kernel 是 CUDA 参考实现（不参与构建：根 Makefile 只编译 internal/cuda）
+/cuda_kernel/
 
 # 依赖副本（若将来执行 go mod vendor，依赖代码同样不属于项目源码）
 /vendor/
