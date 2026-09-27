@@ -1,8 +1,9 @@
 // Package hashac 实现 GYhost 的通用哈希碰撞（离线爆破）模块。
 //
 // 覆盖网络安全中常见的可枚举哈希：MD5/SHA-1/SHA-256/SHA-512 裸摘要、
-// WPA2（PMKID / EAPOL 四次握手）、RAR5、ZIP（ZipCrypto / WinZip AES）、7z AES。
-// 其中一部分算法可交给 internal/cuda 用 GPU 加速（--gpu），其余自动回退 CPU。
+// WPA2（PMKID / EAPOL 四次握手）、RAR5、ZIP（ZipCrypto / WinZip AES）、7z AES、
+// 加密 PDF（RC4-40/128、AES-128/256）。其中一部分算法可交给 internal/cuda 用
+// GPU 加速（--gpu），其余自动回退 CPU。
 //
 // 用法: gyhost hashac -i [哈希文件] -p [密码字典]
 package hashac
@@ -23,16 +24,21 @@ type Kind string
 
 // 支持的目标类型。
 const (
-	KindMD5       Kind = "md5"
-	KindSHA1      Kind = "sha1"
-	KindSHA256    Kind = "sha256"
-	KindSHA512    Kind = "sha512"
-	KindWPA2PMKID Kind = "wpa2-pmkid"
-	KindWPA2EAPOL Kind = "wpa2-eapol"
-	KindRAR5      Kind = "rar5"
-	KindZIPAES    Kind = "zip-aes"
-	KindZipCrypto Kind = "zipcrypto"
-	Kind7z        Kind = "7z"
+	KindMD5         Kind = "md5"
+	KindSHA1        Kind = "sha1"
+	KindSHA256      Kind = "sha256"
+	KindSHA512      Kind = "sha512"
+	KindWPA2PMKID   Kind = "wpa2-pmkid"
+	KindWPA2EAPOL   Kind = "wpa2-eapol"
+	KindRAR5        Kind = "rar5"
+	KindZIPAES      Kind = "zip-aes"
+	KindZipCrypto   Kind = "zipcrypto"
+	Kind7z          Kind = "7z"
+	KindPDFRC440    Kind = "pdf-rc4-40"
+	KindPDFRC4128   Kind = "pdf-rc4-128"
+	KindPDFAES128   Kind = "pdf-aes-128"
+	KindPDFAES256   Kind = "pdf-aes-256"
+	KindPDFAES256R6 Kind = "pdf-aes-256-r6"
 )
 
 // Checker 校验一个已知哈希（实现必须并发安全：只读）。
@@ -84,6 +90,8 @@ func Parse(line string, modeOverride int) (*Target, error) {
 		return parseZipCrypto(h)
 	case strings.HasPrefix(h, "$7z$"):
 		return parse7z(h)
+	case strings.HasPrefix(h, "$pdf$"):
+		return parsePDF(h, modeOverride)
 	}
 
 	if isHex(h) {
@@ -131,6 +139,8 @@ func parseMode(h string, mode int) (*Target, error) {
 		return parseZipCrypto(h)
 	case 11600:
 		return parse7z(h)
+	case 10400, 10500, 10600, 10700:
+		return parsePDF(h, mode)
 	}
 	return nil, errors.New(i18n.Tf("hashac.err.mode", mode))
 }

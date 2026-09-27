@@ -10,6 +10,7 @@ import (
 	"gyhost/internal/cli"
 	"gyhost/internal/module"
 	"gyhost/modules/hashac"
+	"gyhost/modules/hashcat"
 	"gyhost/modules/hashdump"
 	"gyhost/modules/shadow"
 )
@@ -20,6 +21,7 @@ func main() {
 	// ---- 在此注册全部功能模块 ----
 	registry.MustRegister(shadow.New())
 	registry.MustRegister(hashdump.New())
+	registry.MustRegister(hashcat.New())
 	registry.MustRegister(hashac.New())
 	// registry.MustRegister(<新模块>.New())
 

@@ -234,17 +234,18 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== hashdump 模块 ====================
 		"hashdump.group":      "本地分析",
-		"hashdump.summary":    "从加密压缩包或无线抓包中提取可枚举的哈希",
-		"hashdump.flag.input": "压缩包/抓包路径（可重复；给目录时扫描其中的 zip/7z/rar/cap）",
+		"hashdump.summary":    "从加密压缩包、加密文档或无线抓包中提取可枚举的哈希",
+		"hashdump.flag.input": "压缩包/文档/抓包路径（可重复；给目录时扫描其中的 zip/7z/rar/pdf/cap）",
 		"hashdump.flag.out":   "将提取的哈希写入该文件（默认输出到 stdout）",
 		"hashdump.flag.quiet": "静默模式，不在 stderr 显示统计与提示",
-		"hashdump.usage": `gyhost hashdump - 从加密压缩包或无线抓包中提取可枚举的哈希
+		"hashdump.usage": `gyhost hashdump - 从加密压缩包、加密文档或无线抓包中提取可枚举的哈希
 
 用法:
-  gyhost hashdump -i [压缩包/抓包] [选项...]
+  gyhost hashdump -i [压缩包/文档/抓包] [选项...]
 
 参数:
-  -i, -input    压缩包或抓包路径（可重复；给目录时扫描其中的 zip/7z/rar/cap/pcap/pcapng）
+  -i, -input    输入路径，可重复；给目录时按扩展名扫描
+                （zip/7z/rar、doc/docx/xls/xlsx/ppt/wps、pdf、cap/pcap/pcapng）
   -o, -out      可选，将提取的哈希写入该文件（默认输出到 stdout）
   -q, -quiet    静默模式，不在 stderr 显示统计与提示
 
@@ -256,9 +257,15 @@ var messages = map[Lang]map[string]string{
   zip   ZipCrypto -> -m 17200（deflate）/ -m 17210（stored）；WinZip AES -> -m 13600
   7z    AES-256+SHA256 -> -m 11600（含文件名加密）
   rar   RAR5 -> -m 13000（含头加密 -hp）；RAR4/RAR3 需要已知明文，暂不支持
+  doc   加密 Office/WPS 文档：OOXML agile -> -m 9500（SHA-1）/ -m 9600（SHA-512）
+        OOXML 标准加密 -> -m 9400；Word/Excel 97-2003 -> -m 9700（RC4+MD5）
+        / -m 9800（RC4+SHA1）；输出与 john 的 office2john 逐字节一致
+        未加密文档、WPS 私有格式与 PPT/Access 加密会给出具体跳过原因
   cap   pcap/pcapng 无线抓包 -> -m 22000（WPA/WPA2 PMKID 与四次握手）
         链路类型支持 802.11 / radiotap / Prism / AVS；ESSID 取自 beacon、
         probe response 与 (re)association request，缺失 ESSID 或不完整握手会被跳过
+  pdf   加密 PDF -> -m 10400（RC4-40）/ 10500（RC4-128、AES-128）
+        / 10600（AES-256）/ 10700（AES-256 强化 KDF），按 /Encrypt 的 V/R 自动选择
 
 说明:
   单条数据超过 hashcat 上限的条目会被跳过，并在 stderr 逐条提示原因
@@ -267,16 +274,17 @@ var messages = map[Lang]map[string]string{
   gyhost hashdump -i secret.zip > hashes.txt
   hashcat -m 17200 hashes.txt wordlist.txt
   gyhost hashdump -i secret.7z -o hashes.txt -q && hashcat -m 11600 hashes.txt wordlist.txt
+  gyhost hashdump -i private.docx > office.hashes && hashcat -m 9600 office.hashes wordlist.txt
   gyhost hashdump -i wifite/wifi-01.cap > wpa.hc22000
   hashcat -m 22000 wpa.hc22000 wordlist.txt
   gyhost hashdump -i /path/to/dir 2>/dev/null | sort -u > all.txt
   gyhost help hashdump`,
 
 		// ---- hashdump 错误 ----
-		"hashdump.err.missing_args": "缺少必填参数: -i [压缩包/抓包]",
+		"hashdump.err.missing_args": "缺少必填参数: -i [压缩包/文档/抓包]",
 		"hashdump.err.open":         "无法读取 %s: %v",
 		"hashdump.err.no_archive":   "没有可处理的输入文件",
-		"hashdump.err.unrecognized": "无法识别的文件（不是 zip/7z/rar 或无线抓包）: %s",
+		"hashdump.err.unrecognized": "无法识别的文件（不是 zip/7z/rar、Office 文档或无线抓包）: %s",
 		"hashdump.err.rar4":         "暂不支持 RAR4/RAR3 压缩包（需要已知明文）: %s",
 		"hashdump.err.bad_header":   "压缩包结构异常: %s",
 		"hashdump.err.bad_capture":  "无线抓包结构异常: %s",
@@ -309,9 +317,137 @@ var messages = map[Lang]map[string]string{
 		"hashdump.wifi.entry.eapol": "握手 %s（%s/%s）",
 		"hashdump.wifi.entry.pmkid": "PMKID %s（%s）",
 
+		// ---- hashdump 加密 PDF ----
+		"hashdump.pdf.skip.size":       "PDF 为空或过大（%d 字节），跳过",
+		"hashdump.pdf.skip.no_encrypt": "PDF 未加密（找不到 /Encrypt），无可提取的哈希",
+		"hashdump.pdf.skip.no_id":      "加密字典缺少 /ID[0]，无法提取可校验口令的哈希",
+		"hashdump.pdf.skip.version":    "暂不支持该 PDF 加密版本（V=%d R=%d）",
+		"hashdump.pdf.skip.broken":     "PDF 加密字典不完整（V=%d R=%d）",
+
+		// ---- hashdump Office 文档 ----
+		"hashdump.office.skip.size":       "Office 文档为空或过大（%d 字节），跳过",
+		"hashdump.office.skip.ole":        "OLE 复合文档结构异常: %v",
+		"hashdump.office.skip.broken":     "加密元数据不完整或已损坏",
+		"hashdump.office.skip.external":   "使用外部加密提供程序，暂不支持",
+		"hashdump.office.skip.flags":      "加密标志与加密类型不一致，文件可能已损坏",
+		"hashdump.office.skip.hash_alg":   "不支持的哈希算法 %s",
+		"hashdump.office.skip.cipher":     "暂不支持的加密算法 %s（仅支持 AES）",
+		"hashdump.office.skip.access":     "暂不支持 Access 加密数据库",
+		"hashdump.office.skip.ppt":        "暂不支持 PowerPoint 加密文档",
+		"hashdump.office.skip.no_streams": "OLE 文档里没有受支持的加密数据",
+		"hashdump.office.skip.xor":        "XOR 混淆加密，hashcat 不支持",
+		"hashdump.office.skip.wps":        "WPS 私有格式的文档，hashcat 无对应模式",
+		"hashdump.office.skip.no_encrypt": "文档未加密，无可提取的哈希",
+		"hashdump.office.skip.doc_header": "无法识别的 Word 加密头",
+		"hashdump.office.skip.key_size":   "不支持的 RC4 密钥长度 %d 位",
+
+		// ==================== hashcat 模块 ====================
+		"hashcat.group":      "本地分析",
+		"hashcat.summary":    "识别加密文件与哈希的算法类型，给出对应的 hashcat 模式号",
+		"hashcat.flag.input": "待分析的文件/目录路径（可重复；给目录时扫描其中的压缩包、文档、抓包与哈希清单）",
+		"hashcat.flag.quiet": "静默模式，不显示跳过原因与结尾提示",
+		"hashcat.flag.list":  "列出 GYhost 可识别的算法与对应 hashcat 模式",
+		"hashcat.usage": `gyhost hashcat - 识别加密文件与哈希的算法类型，给出 hashcat 模式号
+
+用法:
+  gyhost hashcat -i [文件...] [选项...]
+
+参数:
+  -i, -input    待分析的路径，可重复；给目录时扫描其中的
+                zip/7z/rar/pdf/cap/pcap/pcapng 与 txt/hash/hashes
+  -q, -quiet    静默模式，不显示跳过原因与结尾提示
+  --list        只看算法与 hashcat 模式的对照表
+
+输出:
+  分析结果 -> stdout，每个条目给出算法名与可直接使用的 -m 模式号
+
+识别范围:
+  容器   zip / 7z / rar / 加密 PDF / 无线抓包
+  清单   每行一条哈希；兼容 shadow 的 user:hash:... 与 potfile 的 hash:密码
+  摘要   MD5/NTLM、SHA-1、SHA-256、SHA-512（32/40/64/128 位十六进制）
+  口令   $1$ $apr1$ $5$ $6$ $2*$ $argon2*$ $scrypt$ $pbkdf2-sha256$ $y$
+  文档   $office$ 2007/2010/2013/2016、$oldoffice$ 0/1/3/4
+
+说明:
+  32 位十六进制在 MD5 与 NTLM 之间有歧义，两个模式号都会给出；
+  yescrypt（$y$）在 hashcat 中没有原生模式，只给出算法名
+
+示例:
+  gyhost hashcat -i secret.zip              # 这个压缩包用了什么算法
+  gyhost hashcat -i hashes.txt              # 逐行识别哈希类型
+  gyhost hashcat -i /etc/shadow             # shadow 里都是什么口令哈希
+  gyhost hashcat -i /path/to/dir            # 批量分析整个目录
+  gyhost hashcat --list                     # 只看对照表
+  gyhost help hashcat`,
+
+		// ---- hashcat 错误 ----
+		"hashcat.err.missing_args": "缺少必填参数: -i [文件...]",
+		"hashcat.err.no_input":     "没有可分析的输入文件",
+		"hashcat.err.empty":        "未识别到可分析的条目",
+		"hashcat.err.unknown":      "无法识别的哈希类型",
+		"hashcat.err.binary":       "不是文本哈希清单，也不是受支持的加密容器（二进制文件）",
+
+		// ---- hashcat 输出 ----
+		"hashcat.line":            "第 %d 行",
+		"hashcat.named":           "%s（第 %d 行）",
+		"hashcat.label.algo":      "算法",
+		"hashcat.label.mode":      "模式",
+		"hashcat.label.container": "容器",
+		"hashcat.label.hint":      "提示",
+		"hashcat.hint.dump":       "条目在文件内部，先用 gyhost hashdump 导出，再交给 hashcat",
+		"hashcat.hint.crack":      "该文件本身就是哈希清单，可直接交给 hashcat 或 gyhost hashac",
+		"hashcat.mode.none":       "无原生模式",
+		"hashcat.list.title":      "GYhost 可识别的算法与 hashcat 模式对照表",
+
+		// ---- hashcat 分类 ----
+		"hashcat.kind.digest": "裸摘要",
+		"hashcat.kind.crypt":  "口令哈希（shadow/Unix）",
+		"hashcat.kind.office": "MS Office 文档",
+		"hashcat.kind.zip":    "ZIP 压缩包",
+		"hashcat.kind.7z":     "7z 压缩包",
+		"hashcat.kind.rar":    "RAR 压缩包",
+		"hashcat.kind.pdf":    "加密 PDF",
+		"hashcat.kind.wifi":   "无线抓包",
+
+		// ---- hashcat 算法 ----
+		"hashcat.algo.md5-ntlm":          "MD5 / NTLM（32 位十六进制，歧义）",
+		"hashcat.algo.sha1":              "SHA-1",
+		"hashcat.algo.sha256":            "SHA-256",
+		"hashcat.algo.sha512":            "SHA-512",
+		"hashcat.algo.md5crypt":          "md5crypt（$1$）",
+		"hashcat.algo.md5crypt-apr1":     "md5crypt-apr1（$apr1$）",
+		"hashcat.algo.sha256crypt":       "sha256crypt（$5$）",
+		"hashcat.algo.sha512crypt":       "sha512crypt（$6$）",
+		"hashcat.algo.bcrypt":            "bcrypt（$2*$）",
+		"hashcat.algo.scrypt":            "scrypt（$scrypt$）",
+		"hashcat.algo.argon2":            "Argon2（$argon2*$）",
+		"hashcat.algo.django-pbkdf2":     "Django PBKDF2-SHA256",
+		"hashcat.algo.yescrypt":          "yescrypt（$y$）",
+		"hashcat.algo.office-2007":       "MS Office 2007",
+		"hashcat.algo.office-2010":       "MS Office 2010",
+		"hashcat.algo.office-2013":       "MS Office 2013",
+		"hashcat.algo.office-2016":       "MS Office 2016（SheetProtection）",
+		"hashcat.algo.office-2003-md5":   "MS Office ≤2003（MD5+RC4）",
+		"hashcat.algo.office-2003-sha1":  "MS Office ≤2003（SHA1+RC4）",
+		"hashcat.algo.zipcrypto-deflate": "ZipCrypto（deflate 压缩）",
+		"hashcat.algo.zipcrypto-stored":  "ZipCrypto（未压缩）",
+		"hashcat.algo.zip-aes128":        "WinZip AES-128",
+		"hashcat.algo.zip-aes192":        "WinZip AES-192",
+		"hashcat.algo.zip-aes256":        "WinZip AES-256",
+		"hashcat.algo.7z-aes":            "7z AES-256",
+		"hashcat.algo.rar5-aes":          "RAR5 AES-256",
+		"hashcat.algo.pdf-rc4-40":        "PDF RC4-40",
+		"hashcat.algo.pdf-rc4-128":       "PDF RC4-128",
+		"hashcat.algo.pdf-aes-128":       "PDF AES-128",
+		"hashcat.algo.pdf-aes-256":       "PDF AES-256",
+		"hashcat.algo.pdf-aes-256-r6":    "PDF AES-256（强化 KDF）",
+		"hashcat.algo.wpa2-pmkid":        "WPA2 PMKID",
+		"hashcat.algo.wpa2-eapol":        "WPA2 四次握手（EAPOL）",
+		"hashcat.algo.unknown":           "未知/无法识别",
+
 		// ==================== hashac 模块 ====================
 		"hashac.group":   "本地分析",
-		"hashac.summary": "枚举 MD5/WPA2/RAR/ZIP/7z 等常见哈希的明文碰撞",
+		"hashac.summary": "枚举 MD5/WPA2/RAR/ZIP/7z/PDF 等常见哈希的明文碰撞",
 		"hashac.usage": `gyhost hashac - 枚举常见哈希的明文碰撞
 
 用法:
@@ -337,7 +473,9 @@ var messages = map[Lang]map[string]string{
   zip-aes                        $zip2$...（-m 13600）
   zipcrypto                      $pkzip2$...（-m 17200/17210）
   7z                             $7z$...（-m 11600）
-  其中 $... 格式可由 gyhost hashdump 直接从加密压缩包提取
+  pdf                            $pdf$...（-m 10400/10500/10600/10700）
+                                 V<=4 的 RC4/AES 与 V=5 的 AES-256，用户/所有者口令都试
+  其中 $... 格式可由 gyhost hashdump 直接从加密压缩包或加密 PDF 提取
 
 输出:
   命中与统计 -> stdout，实时进度与提示 -> stderr（2>/dev/null 只看结果）
@@ -361,16 +499,21 @@ var messages = map[Lang]map[string]string{
 		"hashac.flag.gpu":     "用 GPU (CUDA) 加速可支持的算法，其余自动回退 CPU（需要 root/管理员权限）",
 
 		// ---- hashac 目标类型 ----
-		"hashac.algo.md5":        "MD5",
-		"hashac.algo.sha1":       "SHA-1",
-		"hashac.algo.sha256":     "SHA-256",
-		"hashac.algo.sha512":     "SHA-512",
-		"hashac.algo.wpa2-pmkid": "WPA2-PMKID",
-		"hashac.algo.wpa2-eapol": "WPA2-EAPOL",
-		"hashac.algo.rar5":       "RAR5",
-		"hashac.algo.zip-aes":    "ZIP-AES",
-		"hashac.algo.zipcrypto":  "ZIP-ZipCrypto",
-		"hashac.algo.7z":         "7z-AES",
+		"hashac.algo.md5":            "MD5",
+		"hashac.algo.sha1":           "SHA-1",
+		"hashac.algo.sha256":         "SHA-256",
+		"hashac.algo.sha512":         "SHA-512",
+		"hashac.algo.wpa2-pmkid":     "WPA2-PMKID",
+		"hashac.algo.wpa2-eapol":     "WPA2-EAPOL",
+		"hashac.algo.rar5":           "RAR5",
+		"hashac.algo.zip-aes":        "ZIP-AES",
+		"hashac.algo.zipcrypto":      "ZIP-ZipCrypto",
+		"hashac.algo.7z":             "7z-AES",
+		"hashac.algo.pdf-rc4-40":     "PDF RC4-40",
+		"hashac.algo.pdf-rc4-128":    "PDF RC4-128",
+		"hashac.algo.pdf-aes-128":    "PDF AES-128",
+		"hashac.algo.pdf-aes-256":    "PDF AES-256",
+		"hashac.algo.pdf-aes-256-r6": "PDF AES-256（强化 KDF）",
 
 		// ---- hashac 错误 ----
 		"hashac.err.missing_args":  "缺少必填参数: -i [哈希文件]，以及 -p [密码字典] 或 -m [掩码] 之一",
@@ -378,6 +521,8 @@ var messages = map[Lang]map[string]string{
 		"hashac.err.mask":          "掩码表达式非法",
 		"hashac.err.threads":       "线程数必须大于 0: %d",
 		"hashac.err.mode":          "不支持的 hashcat 模式号: %d",
+		"hashac.err.pdf_version":   "不支持的 PDF 加密版本 V=%d R=%d",
+		"hashac.err.pdf_mode":      "该 PDF 哈希的 V/R 对应 -m %d，与 --mode %d 不符",
 		"hashac.err.open_input":    "无法读取哈希文件 %s",
 		"hashac.err.read_input":    "读取哈希文件失败",
 		"hashac.err.open_dict":     "打开密码字典失败",
@@ -557,17 +702,18 @@ Examples:
 
 		// ==================== hashdump module ====================
 		"hashdump.group":      "Local Analysis",
-		"hashdump.summary":    "Extract crackable hashes from encrypted archives and wireless captures",
-		"hashdump.flag.input": "path to the archive/capture (repeatable; a directory scans its zip/7z/rar/cap files)",
+		"hashdump.summary":    "Extract crackable hashes from encrypted archives, documents and wireless captures",
+		"hashdump.flag.input": "path to the archive/document/capture (repeatable; a directory scans its zip/7z/rar/pdf/cap files)",
 		"hashdump.flag.out":   "write the extracted hashes to this file (default: stdout)",
 		"hashdump.flag.quiet": "quiet mode, hide summary and notices on stderr",
-		"hashdump.usage": `gyhost hashdump - Extract crackable hashes from encrypted archives and wireless captures
+		"hashdump.usage": `gyhost hashdump - Extract crackable hashes from encrypted archives, documents and wireless captures
 
 Usage:
-  gyhost hashdump -i [archive|capture] [options...]
+  gyhost hashdump -i [archive|document|capture] [options...]
 
 Options:
-  -i, -input    path to an archive or capture (repeatable; a directory scans its zip/7z/rar/cap/pcap/pcapng files)
+  -i, -input    input path, repeatable; a directory scans by extension
+                (zip/7z/rar, doc/docx/xls/xlsx/ppt/wps, pdf, cap/pcap/pcapng)
   -o, -out      optional, write the extracted hashes to this file (default: stdout)
   -q, -quiet    quiet mode, hide summary and notices on stderr
 
@@ -579,10 +725,18 @@ Supported formats:
   zip   ZipCrypto -> -m 17200 (deflate) / -m 17210 (stored); WinZip AES -> -m 13600
   7z    AES-256+SHA256 -> -m 11600 (including encrypted file names)
   rar   RAR5 -> -m 13000 (including encrypted headers -hp); RAR4/RAR3 not supported
+  doc   encrypted Office/WPS documents: OOXML agile -> -m 9500 (SHA-1)
+        / -m 9600 (SHA-512); OOXML standard -> -m 9400;
+        Word/Excel 97-2003 -> -m 9700 (RC4+MD5) / -m 9800 (RC4+SHA1);
+        output is byte-identical to john's office2john
+        unencrypted documents, WPS private format and PPT/Access are reported
+        with a specific skip reason
   cap   pcap/pcapng wireless capture -> -m 22000 (WPA/WPA2 PMKID and 4-way handshake)
         link types 802.11 / radiotap / Prism / AVS; the ESSID is taken from beacons,
         probe responses and (re)association requests; missing ESSID or an incomplete
         handshake is skipped
+  pdf   encrypted PDF -> -m 10400 (RC4-40) / 10500 (RC4-128, AES-128)
+        / 10600 (AES-256) / 10700 (AES-256 hardened KDF), picked from /Encrypt V/R
 
 Notes:
   entries whose data exceeds the hashcat limit are skipped and reported on stderr
@@ -591,16 +745,17 @@ Examples:
   gyhost hashdump -i secret.zip > hashes.txt
   hashcat -m 17200 hashes.txt wordlist.txt
   gyhost hashdump -i secret.7z -o hashes.txt -q && hashcat -m 11600 hashes.txt wordlist.txt
+  gyhost hashdump -i private.docx > office.hashes && hashcat -m 9600 office.hashes wordlist.txt
   gyhost hashdump -i wifite/wifi-01.cap > wpa.hc22000
   hashcat -m 22000 wpa.hc22000 wordlist.txt
   gyhost hashdump -i /path/to/dir 2>/dev/null | sort -u > all.txt
   gyhost help hashdump`,
 
 		// ---- hashdump errors ----
-		"hashdump.err.missing_args": "missing required option: -i [archive|capture]",
+		"hashdump.err.missing_args": "missing required option: -i [archive|document|capture]",
 		"hashdump.err.open":         "cannot read %s: %v",
 		"hashdump.err.no_archive":   "no input file to process",
-		"hashdump.err.unrecognized": "unrecognized file (not a zip/7z/rar or wireless capture): %s",
+		"hashdump.err.unrecognized": "unrecognized file (not a zip/7z/rar, Office document or wireless capture): %s",
 		"hashdump.err.rar4":         "RAR4/RAR3 archives are not supported yet (known plaintext required): %s",
 		"hashdump.err.bad_header":   "broken archive structure: %s",
 		"hashdump.err.bad_capture":  "broken capture structure: %s",
@@ -633,9 +788,138 @@ Examples:
 		"hashdump.wifi.entry.eapol": "handshake %s (%s/%s)",
 		"hashdump.wifi.entry.pmkid": "PMKID %s (%s)",
 
+		// ---- hashdump encrypted PDF ----
+		"hashdump.pdf.skip.size":       "PDF is empty or too large (%d bytes), skipped",
+		"hashdump.pdf.skip.no_encrypt": "PDF is not encrypted (no /Encrypt found), nothing to extract",
+		"hashdump.pdf.skip.no_id":      "encryption dictionary has no /ID[0], no verifiable password hash to extract",
+		"hashdump.pdf.skip.version":    "unsupported PDF encryption version (V=%d R=%d)",
+		"hashdump.pdf.skip.broken":     "incomplete PDF encryption dictionary (V=%d R=%d)",
+
+		// ---- hashdump Office documents ----
+		"hashdump.office.skip.size":       "Office document is empty or too large (%d bytes), skipped",
+		"hashdump.office.skip.ole":        "broken OLE compound document: %v",
+		"hashdump.office.skip.broken":     "incomplete or corrupted encryption metadata",
+		"hashdump.office.skip.external":   "external cryptographic provider is not supported",
+		"hashdump.office.skip.flags":      "encryption flags do not match the encryption type, file may be corrupted",
+		"hashdump.office.skip.hash_alg":   "unsupported hash algorithm %s",
+		"hashdump.office.skip.cipher":     "unsupported cipher algorithm %s (AES only)",
+		"hashdump.office.skip.access":     "encrypted Access databases are not supported yet",
+		"hashdump.office.skip.ppt":        "encrypted PowerPoint documents are not supported yet",
+		"hashdump.office.skip.no_streams": "no supported encryption data found in the OLE document",
+		"hashdump.office.skip.xor":        "XOR obfuscation, not supported by hashcat",
+		"hashdump.office.skip.wps":        "WPS private format document, hashcat has no matching mode",
+		"hashdump.office.skip.no_encrypt": "document is not encrypted, nothing to extract",
+		"hashdump.office.skip.doc_header": "unrecognized Word encryption header",
+		"hashdump.office.skip.key_size":   "unsupported RC4 key size %d bits",
+
+		// ==================== hashcat module ====================
+		"hashcat.group":      "Local Analysis",
+		"hashcat.summary":    "Identify the algorithm behind encrypted files and hashes, with the matching hashcat mode",
+		"hashcat.flag.input": "path to the file/directory to analyze (repeatable; a directory scans its archives, documents, captures and hash lists)",
+		"hashcat.flag.quiet": "quiet mode, hide skip reasons and the trailing hint",
+		"hashcat.flag.list":  "list the algorithms GYhost can identify with their hashcat modes",
+		"hashcat.usage": `gyhost hashcat - identify the algorithm behind encrypted files and hashes
+
+Usage:
+  gyhost hashcat -i [file...] [options]
+
+Options:
+  -i, -input    path to analyze, repeatable; a directory scans its
+                zip/7z/rar/pdf/cap/pcap/pcapng and txt/hash/hashes files
+  -q, -quiet    quiet mode, hide skip reasons and the trailing hint
+  --list        only print the algorithm / hashcat mode reference table
+
+Output:
+  analysis -> stdout, one entry per item with the algorithm name and
+  a ready-to-use -m mode number
+
+What is recognized:
+  containers  zip / 7z / rar / encrypted PDF / wireless capture
+  hash lists  one hash per line; also shadow's user:hash:... and potfile's hash:password
+  digests     MD5/NTLM, SHA-1, SHA-256, SHA-512 (32/40/64/128 hex chars)
+  passwords   $1$ $apr1$ $5$ $6$ $2*$ $argon2*$ $scrypt$ $pbkdf2-sha256$ $y$
+  documents   $office$ 2007/2010/2013/2016, $oldoffice$ 0/1/3/4
+
+Notes:
+  32 hex chars is ambiguous between MD5 and NTLM, so both modes are printed;
+  yescrypt ($y$) has no native hashcat mode, only the algorithm name is shown
+
+Examples:
+  gyhost hashcat -i secret.zip              # which algorithm does this archive use
+  gyhost hashcat -i hashes.txt              # identify every hash in the list
+  gyhost hashcat -i /etc/shadow             # what password hashes are in this shadow
+  gyhost hashcat -i /path/to/dir            # analyze a whole directory
+  gyhost hashcat --list                     # reference table only
+  gyhost help hashcat`,
+
+		// ---- hashcat errors ----
+		"hashcat.err.missing_args": "missing required option: -i [file...]",
+		"hashcat.err.no_input":     "no input file to analyze",
+		"hashcat.err.empty":        "no entry identified",
+		"hashcat.err.unknown":      "unrecognized hash type",
+		"hashcat.err.binary":       "not a text hash list and not a supported encrypted container (binary file)",
+
+		// ---- hashcat output ----
+		"hashcat.line":            "line %d",
+		"hashcat.named":           "%s (line %d)",
+		"hashcat.label.algo":      "Algorithm",
+		"hashcat.label.mode":      "Mode",
+		"hashcat.label.container": "Container",
+		"hashcat.label.hint":      "Hint",
+		"hashcat.hint.dump":       "entries live inside the file: export them with gyhost hashdump first, then feed hashcat",
+		"hashcat.hint.crack":      "this file is already a hash list: feed it to hashcat or gyhost hashac directly",
+		"hashcat.mode.none":       "no native mode",
+		"hashcat.list.title":      "Algorithms identified by GYhost and their hashcat modes",
+
+		// ---- hashcat categories ----
+		"hashcat.kind.digest": "Raw digest",
+		"hashcat.kind.crypt":  "Password hash (shadow/Unix)",
+		"hashcat.kind.office": "MS Office document",
+		"hashcat.kind.zip":    "ZIP archive",
+		"hashcat.kind.7z":     "7z archive",
+		"hashcat.kind.rar":    "RAR archive",
+		"hashcat.kind.pdf":    "Encrypted PDF",
+		"hashcat.kind.wifi":   "Wireless capture",
+
+		// ---- hashcat algorithms ----
+		"hashcat.algo.md5-ntlm":          "MD5 / NTLM (ambiguous 32-hex)",
+		"hashcat.algo.sha1":              "SHA-1",
+		"hashcat.algo.sha256":            "SHA-256",
+		"hashcat.algo.sha512":            "SHA-512",
+		"hashcat.algo.md5crypt":          "md5crypt ($1$)",
+		"hashcat.algo.md5crypt-apr1":     "md5crypt-apr1 ($apr1$)",
+		"hashcat.algo.sha256crypt":       "sha256crypt ($5$)",
+		"hashcat.algo.sha512crypt":       "sha512crypt ($6$)",
+		"hashcat.algo.bcrypt":            "bcrypt ($2*$)",
+		"hashcat.algo.scrypt":            "scrypt ($scrypt$)",
+		"hashcat.algo.argon2":            "Argon2 ($argon2*$)",
+		"hashcat.algo.django-pbkdf2":     "Django PBKDF2-SHA256",
+		"hashcat.algo.yescrypt":          "yescrypt ($y$)",
+		"hashcat.algo.office-2007":       "MS Office 2007",
+		"hashcat.algo.office-2010":       "MS Office 2010",
+		"hashcat.algo.office-2013":       "MS Office 2013",
+		"hashcat.algo.office-2016":       "MS Office 2016 (SheetProtection)",
+		"hashcat.algo.office-2003-md5":   "MS Office <=2003 (MD5+RC4)",
+		"hashcat.algo.office-2003-sha1":  "MS Office <=2003 (SHA1+RC4)",
+		"hashcat.algo.zipcrypto-deflate": "ZipCrypto (deflate)",
+		"hashcat.algo.zipcrypto-stored":  "ZipCrypto (stored)",
+		"hashcat.algo.zip-aes128":        "WinZip AES-128",
+		"hashcat.algo.zip-aes192":        "WinZip AES-192",
+		"hashcat.algo.zip-aes256":        "WinZip AES-256",
+		"hashcat.algo.7z-aes":            "7z AES-256",
+		"hashcat.algo.rar5-aes":          "RAR5 AES-256",
+		"hashcat.algo.pdf-rc4-40":        "PDF RC4-40",
+		"hashcat.algo.pdf-rc4-128":       "PDF RC4-128",
+		"hashcat.algo.pdf-aes-128":       "PDF AES-128",
+		"hashcat.algo.pdf-aes-256":       "PDF AES-256",
+		"hashcat.algo.pdf-aes-256-r6":    "PDF AES-256 (hardened KDF)",
+		"hashcat.algo.wpa2-pmkid":        "WPA2 PMKID",
+		"hashcat.algo.wpa2-eapol":        "WPA2 4-way handshake (EAPOL)",
+		"hashcat.algo.unknown":           "unknown",
+
 		// ==================== hashac module ====================
 		"hashac.group":   "Local Analysis",
-		"hashac.summary": "Enumerate plaintext collisions for common hashes (MD5/WPA2/RAR/ZIP/7z)",
+		"hashac.summary": "Enumerate plaintext collisions for common hashes (MD5/WPA2/RAR/ZIP/7z/PDF)",
 		"hashac.usage": `gyhost hashac - enumerate plaintext collisions for common hashes
 
 Usage:
@@ -661,7 +945,9 @@ Supported types (auto detected; hashcat mode in parentheses):
   zip-aes                        $zip2$... (-m 13600)
   zipcrypto                      $pkzip2$... (-m 17200/17210)
   7z                             $7z$... (-m 11600)
-  the $... forms can be produced by "gyhost hashdump" from encrypted archives
+  pdf                            $pdf$... (-m 10400/10500/10600/10700)
+                                 RC4/AES for V<=4 and AES-256 for V=5; tries user and owner passwords
+  the $... forms can be produced by "gyhost hashdump" from encrypted archives or PDFs
 
 Output:
   hits and summary -> stdout, live progress and notices -> stderr (2>/dev/null keeps hits only)
@@ -685,16 +971,21 @@ Examples:
 		"hashac.flag.gpu":     "use the GPU (CUDA) for supported algorithms, others fall back to CPU (requires root/administrator)",
 
 		// ---- hashac target types ----
-		"hashac.algo.md5":        "MD5",
-		"hashac.algo.sha1":       "SHA-1",
-		"hashac.algo.sha256":     "SHA-256",
-		"hashac.algo.sha512":     "SHA-512",
-		"hashac.algo.wpa2-pmkid": "WPA2-PMKID",
-		"hashac.algo.wpa2-eapol": "WPA2-EAPOL",
-		"hashac.algo.rar5":       "RAR5",
-		"hashac.algo.zip-aes":    "ZIP-AES",
-		"hashac.algo.zipcrypto":  "ZIP-ZipCrypto",
-		"hashac.algo.7z":         "7z-AES",
+		"hashac.algo.md5":            "MD5",
+		"hashac.algo.sha1":           "SHA-1",
+		"hashac.algo.sha256":         "SHA-256",
+		"hashac.algo.sha512":         "SHA-512",
+		"hashac.algo.wpa2-pmkid":     "WPA2-PMKID",
+		"hashac.algo.wpa2-eapol":     "WPA2-EAPOL",
+		"hashac.algo.rar5":           "RAR5",
+		"hashac.algo.zip-aes":        "ZIP-AES",
+		"hashac.algo.zipcrypto":      "ZIP-ZipCrypto",
+		"hashac.algo.7z":             "7z-AES",
+		"hashac.algo.pdf-rc4-40":     "PDF RC4-40",
+		"hashac.algo.pdf-rc4-128":    "PDF RC4-128",
+		"hashac.algo.pdf-aes-128":    "PDF AES-128",
+		"hashac.algo.pdf-aes-256":    "PDF AES-256",
+		"hashac.algo.pdf-aes-256-r6": "PDF AES-256 (hardened KDF)",
 
 		// ---- hashac errors ----
 		"hashac.err.missing_args":  "missing required options: -i [hash file], plus either -p [wordlist] or -m [mask]",
@@ -702,6 +993,8 @@ Examples:
 		"hashac.err.mask":          "invalid mask expression",
 		"hashac.err.threads":       "thread count must be greater than 0: %d",
 		"hashac.err.mode":          "unsupported hashcat mode number: %d",
+		"hashac.err.pdf_version":   "unsupported PDF encryption version V=%d R=%d",
+		"hashac.err.pdf_mode":      "this PDF hash maps V/R to -m %d, which conflicts with --mode %d",
 		"hashac.err.open_input":    "cannot read the hash file %s",
 		"hashac.err.read_input":    "failed to read the hash file",
 		"hashac.err.open_dict":     "failed to open the wordlist",

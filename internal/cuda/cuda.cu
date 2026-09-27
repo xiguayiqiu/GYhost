@@ -435,7 +435,21 @@ GY_HOSTDEV void gy_sha512_update(GySHA512Ctx *c, const void *data, int n) {
     }
 }
 
-GY_HOSTDEV void gy_sha512_final(GySHA512Ctx *c, uint8_t out[64]) {
+/* SHA-384 与 SHA-512 的区别只有初始向量与输出长度，共用同一套压缩函数 */
+GY_HOSTDEV void gy_sha384_init(GySHA512Ctx *c) {
+    c->nbytes = 0;
+    c->buflen = 0;
+    c->state[0] = 0xcbbb9d5dc1059ed8ULL;
+    c->state[1] = 0x629a292a367cd507ULL;
+    c->state[2] = 0x9159015a3070dd17ULL;
+    c->state[3] = 0x152fecd8f70e5939ULL;
+    c->state[4] = 0x67332667ffc00b31ULL;
+    c->state[5] = 0x8eb44a8768581511ULL;
+    c->state[6] = 0xdb0c2e0d64f98fa7ULL;
+    c->state[7] = 0x47b5481dbefa4fa4ULL;
+}
+
+GY_HOSTDEV void gy_sha512_final_n(GySHA512Ctx *c, uint8_t *out, int outlen) {
     const uint64_t hi = c->nbytes >> 61;
     const uint64_t lo = c->nbytes << 3;
     const uint8_t pad = 0x80;
@@ -454,16 +468,18 @@ GY_HOSTDEV void gy_sha512_final(GySHA512Ctx *c, uint8_t out[64]) {
     }
     gy_sha512_transform(c->state, c->buf);
 
-    for (i = 0; i < 8; i++) {
-        out[i * 8 + 0] = (uint8_t)(c->state[i] >> 56);
-        out[i * 8 + 1] = (uint8_t)(c->state[i] >> 48);
-        out[i * 8 + 2] = (uint8_t)(c->state[i] >> 40);
-        out[i * 8 + 3] = (uint8_t)(c->state[i] >> 32);
-        out[i * 8 + 4] = (uint8_t)(c->state[i] >> 24);
-        out[i * 8 + 5] = (uint8_t)(c->state[i] >> 16);
-        out[i * 8 + 6] = (uint8_t)(c->state[i] >> 8);
-        out[i * 8 + 7] = (uint8_t)(c->state[i]);
+    /* SHA-384 取状态前 48 字节，SHA-512 取 64 字节 */
+    for (i = 0; i < outlen; i++) {
+        out[i] = (uint8_t)(c->state[i >> 3] >> (56 - 8 * (i & 7)));
     }
+}
+
+GY_HOSTDEV void gy_sha512_final(GySHA512Ctx *c, uint8_t out[64]) {
+    gy_sha512_final_n(c, out, 64);
+}
+
+GY_HOSTDEV void gy_sha384_final(GySHA512Ctx *c, uint8_t out[48]) {
+    gy_sha512_final_n(c, out, 48);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1225,6 +1241,16 @@ GY_HOSTDEV inline uint8_t gy_aes_mul(uint8_t a, uint8_t b) {
     return p;
 }
 
+/* xtime / ×3：正向 MixColumns 只需要这两个常量乘法，展开成单步运算，
+ * 比走 gy_aes_mul 的 8 轮逐位循环快得多（R=6 的 PDF 强化是本文件最热的路径）。 */
+GY_HOSTDEV inline uint8_t gy_aes_xtime(uint8_t a) {
+    return (uint8_t)((uint8_t)(a << 1) ^ ((a & 0x80) ? 0x1b : 0));
+}
+
+GY_HOSTDEV inline uint8_t gy_aes_mul3(uint8_t a) {
+    return (uint8_t)(gy_aes_xtime(a) ^ a);
+}
+
 GY_HOSTDEV inline void gy_aes_inv_mixcol(uint8_t *p) {
     const uint8_t a0 = p[0], a1 = p[1], a2 = p[2], a3 = p[3];
     p[0] = (uint8_t)(gy_aes_mul(a0, 14) ^ gy_aes_mul(a1, 11) ^ gy_aes_mul(a2, 13) ^ gy_aes_mul(a3, 9));
@@ -1303,10 +1329,10 @@ GY_HOSTDEV void gy_aes_encrypt_key(GyAESKey *k, const uint8_t *key, int keybits)
 /* 正向 MixColumns（与 gy_aes_inv_mixcol 对应） */
 GY_HOSTDEV inline void gy_aes_mixcol(uint8_t *p) {
     const uint8_t a0 = p[0], a1 = p[1], a2 = p[2], a3 = p[3];
-    p[0] = (uint8_t)(gy_aes_mul(a0, 2) ^ gy_aes_mul(a1, 3) ^ a2 ^ a3);
-    p[1] = (uint8_t)(a0 ^ gy_aes_mul(a1, 2) ^ gy_aes_mul(a2, 3) ^ a3);
-    p[2] = (uint8_t)(a0 ^ a1 ^ gy_aes_mul(a2, 2) ^ gy_aes_mul(a3, 3));
-    p[3] = (uint8_t)(gy_aes_mul(a0, 3) ^ a1 ^ a2 ^ gy_aes_mul(a3, 2));
+    p[0] = (uint8_t)(gy_aes_xtime(a0) ^ gy_aes_mul3(a1) ^ a2 ^ a3);
+    p[1] = (uint8_t)(a0 ^ gy_aes_xtime(a1) ^ gy_aes_mul3(a2) ^ a3);
+    p[2] = (uint8_t)(a0 ^ a1 ^ gy_aes_xtime(a2) ^ gy_aes_mul3(a3));
+    p[3] = (uint8_t)(gy_aes_mul3(a0) ^ a1 ^ a2 ^ gy_aes_xtime(a3));
 }
 
 /* AES 正向加密一块（FIPS-197；列主序 s[4c+j] = 第 c 列第 j 行） */
@@ -1760,6 +1786,358 @@ GY_HOSTDEV int gy_wpa2_eapol_check(const uint8_t *pw, int pwlen,
     return gy_memeq(mic, check, 16);
 }
 
+/* ============================ PDF 口令校验 ============================ */
+
+/* 标准安全处理器的 32 字节口令填充串（PDF 32000-1 §7.6.3.3） */
+GY_TABLE(uint8_t, gy_pdf_pad,
+         0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
+         0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+         0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80,
+         0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a);
+
+/* R=6 强化：至少 64 轮，64 轮后由密文末字节是否大于「轮次-32」决定是否继续 */
+#define GY_PDF_MIN_ROUNDS 64
+#define GY_PDF_MAX_ROUNDS 288
+
+/* RC4：KSA + 就地异或（PDF 的 R=2..4 全靠它，与 ZipCrypto 的流密码无关） */
+GY_HOSTDEV void gy_rc4_init(uint8_t s[256], const uint8_t *key, int keylen) {
+    int i, j = 0;
+    uint8_t t;
+    for (i = 0; i < 256; i++) {
+        s[i] = (uint8_t)i;
+    }
+    for (i = 0; i < 256; i++) {
+        j = (j + s[i] + key[i % keylen]) & 0xff;
+        t = s[i]; s[i] = s[j]; s[j] = t;
+    }
+}
+
+GY_HOSTDEV void gy_rc4_xor(uint8_t s[256], uint8_t *data, int len) {
+    int i = 0, j = 0;
+    uint8_t t;
+    for (int n = 0; n < len; n++) {
+        i = (i + 1) & 0xff;
+        j = (j + s[i]) & 0xff;
+        t = s[i]; s[i] = s[j]; s[j] = t;
+        data[n] ^= s[(s[i] + s[j]) & 0xff];
+    }
+}
+
+/* 口令填充/截断到 32 字节：超长只取前 32 字节，不足则在后面追加固定填充串 */
+GY_HOSTDEV void gy_pdf_pad_pw(const uint8_t *pw, int pwlen, uint8_t out[32]) {
+    int n = pwlen;
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > 32) {
+        n = 32;
+    }
+    gy_copy(out, pw, n);
+    gy_copy(out + n, gy_pdf_pad, 32 - n);
+}
+
+/* Algorithm 2/3 的 50 轮 MD5 强化：反复取前 keylen 字节做 MD5 */
+GY_HOSTDEV void gy_pdf_key_rounds(uint8_t d[16], int keylen, int r) {
+    uint8_t tmp[16];
+    GyMD5Ctx c;
+    if (keylen > 16) {
+        keylen = 16;
+    }
+    if (r >= 3) {
+        for (int i = 0; i < 50; i++) {
+            gy_md5_init(&c);
+            gy_md5_update(&c, d, keylen);
+            gy_md5_final(&c, tmp);
+            gy_copy(d, tmp, 16);
+        }
+    }
+}
+
+/* Algorithm 2：MD5(填充口令 ‖ O ‖ P 小端 ‖ ID[0] ‖ FFFFFFFF?)，R>=3 再强化 50 轮 */
+GY_HOSTDEV void gy_pdf_derive_key(const uint8_t padded[32], const uint8_t *o,
+                                  uint32_t p, const uint8_t *id0, int encmeta,
+                                  int r, int keylen, uint8_t key[16]) {
+    uint8_t d[16];
+    GyMD5Ctx c;
+    gy_md5_init(&c);
+    gy_md5_update(&c, padded, 32);
+    gy_md5_update(&c, o, 32);
+    gy_md5_update(&c, (const uint8_t *)&p, 4); /* P 按 32 位小端 */
+    gy_md5_update(&c, id0, 16);
+    if (r >= 4 && !encmeta) {
+        const uint8_t ff[4] = {0xff, 0xff, 0xff, 0xff};
+        gy_md5_update(&c, ff, 4);
+    }
+    gy_md5_final(&c, d);
+    gy_pdf_key_rounds(d, keylen, r);
+    gy_copy(key, d, keylen);
+}
+
+/* Algorithm 4(R=2)/5(R>=3)：重建 /U 与 Check 比对 */
+GY_HOSTDEV int gy_pdf_check_user(const uint8_t padded[32], const uint8_t *o,
+                                 uint32_t p, const uint8_t *id0, int encmeta,
+                                 int r, int keylen, const uint8_t *u) {
+    uint8_t key[16], s[256], buf[16], full[32];
+    GyMD5Ctx c;
+
+    gy_pdf_derive_key(padded, o, p, id0, encmeta, r, keylen, key);
+
+    if (r < 3) {
+        /* U = RC4(key, 32 字节填充串)，全部 32 字节参与比对 */
+        gy_rc4_init(s, key, keylen);
+        gy_copy(full, gy_pdf_pad, 32);
+        gy_rc4_xor(s, full, 32);
+        return gy_memeq(full, u, 32);
+    }
+
+    /* R>=3：U[0:16] = RC4^i(MD5(填充串 ‖ ID[0]))，i=0..19，第 i 轮用 key^i */
+    gy_md5_init(&c);
+    gy_md5_update(&c, gy_pdf_pad, 32);
+    gy_md5_update(&c, id0, 16);
+    gy_md5_final(&c, buf);
+    for (int i = 0; i < 20; i++) {
+        uint8_t kx[16];
+        for (int j = 0; j < keylen; j++) {
+            kx[j] = (uint8_t)(key[j] ^ i);
+        }
+        gy_rc4_init(s, kx, keylen);
+        gy_rc4_xor(s, buf, 16);
+    }
+    return gy_memeq(buf, u, 16);
+}
+
+/*
+ * Algorithm 3 的逆运算：/O 是把"填充后的用户口令"用所有者口令派生的密钥
+ * RC4 迭代加密得到的（R>=3 共 20 轮，按 key^19..key^0 逆序解），还原后走用户校验。
+ */
+GY_HOSTDEV int gy_pdf_check_owner(const uint8_t *pw, int pwlen, const uint8_t *o,
+                                  uint32_t p, const uint8_t *id0, int encmeta,
+                                  int r, int keylen, const uint8_t *u) {
+    uint8_t padded[32], d[16], key[16], s[256], user[32];
+    const int iters = (r >= 3) ? 20 : 1;
+    GyMD5Ctx c;
+
+    gy_pdf_pad_pw(pw, pwlen, padded);
+    gy_md5_init(&c);
+    gy_md5_update(&c, padded, 32);
+    gy_md5_final(&c, d);
+    gy_pdf_key_rounds(d, keylen, r);
+    gy_copy(key, d, keylen);
+
+    gy_copy(user, o, 32);
+    for (int x = iters - 1; x >= 0; x--) {
+        uint8_t kx[16];
+        for (int j = 0; j < keylen; j++) {
+            kx[j] = (uint8_t)(key[j] ^ x);
+        }
+        gy_rc4_init(s, kx, keylen);
+        gy_rc4_xor(s, user, 32);
+    }
+    /* 还原出的已是 32 字节填充口令，直接按用户口令校验 */
+    return gy_pdf_check_user(user, o, p, id0, encmeta, r, keylen, u);
+}
+
+/* R=2..4（-m 10400/10500）：先试用户口令，再用所有者口令反解 /O */
+GY_HOSTDEV int gy_pdf_legacy_check(const uint8_t *pw, int pwlen, const uint8_t *id0,
+                                   const uint8_t *o, const uint8_t *u, uint32_t p,
+                                   int encmeta, int r, int keylen) {
+    uint8_t padded[32];
+    if (keylen < 5 || keylen > 16 || r < 2 || r > 4) {
+        return 0;
+    }
+    if (pwlen < 0) {
+        return 0;
+    }
+    if (pwlen > 32) {
+        pwlen = 32; /* 规范规定口令只用前 32 字节，与 CPU 侧 pdfPad 的截断一致 */
+    }
+    gy_pdf_pad_pw(pw, pwlen, padded);
+    if (gy_pdf_check_user(padded, o, p, id0, encmeta, r, keylen, u)) {
+        return 1;
+    }
+    return gy_pdf_check_owner(pw, pwlen, o, p, id0, encmeta, r, keylen, u);
+}
+
+/*
+ * Algorithm 2.B 的一轮（R=6）：把 (pw ‖ K ‖ udata) 重复 64 次做 AES-128-CBC
+ * （key=K[0:16]，IV=K[16:32]），密文按首块 mod 3 选 SHA-256/384/512 摘出新的 K。
+ *
+ * 明文以 16 字节为界流式喂入，跨段（pw/K/udata、跨重复）的半块留在 carry 里；
+ * 64 份的总长恒为 16 的倍数，因此轮末 carry 必为空。密文先攒满 128 字节
+ * （SHA 的最大分组）再喂给摘要，减少 update 调用次数。
+ *
+ * 成功后把新的 K 写回 k 并更新 *klen，同时返回本轮密文 E 的最后一个字节
+ * （R=6 的续做条件要用它），失败返回 -1。
+ */
+GY_HOSTDEV int gy_pdf_v5_round(const uint8_t *pw, int pwlen, const uint8_t *salt, int saltlen,
+                               const uint8_t *udata, int udatalen,
+                               uint8_t k[64], int *klen) {
+    GyAESKey ak;
+    uint8_t prev[16], carry[16], pt[16], ct[16], stage[128];
+    uint8_t d256[32], d384[48], d512[64];
+    GySHA256Ctx c256;
+    GySHA512Ctx c512;
+    int n = 0, stagen = 0, sum = 0, last = 0, sel = -1;
+
+    gy_aes_encrypt_key(&ak, k, 128);
+    gy_copy(prev, k + 16, 16);
+
+    for (int rep = 0; rep < 64; rep++) {
+        for (int part = 0; part < 3; part++) {
+            const uint8_t *seg;
+            int seglen, off = 0;
+            if (part == 0) {
+                seg = pw; seglen = pwlen;
+            } else if (part == 1) {
+                seg = k; seglen = *klen;
+            } else {
+                seg = udata; seglen = udatalen;
+            }
+            while (off < seglen) {
+                int take = 16 - n;
+                if (take > seglen - off) {
+                    take = seglen - off;
+                }
+                for (int i = 0; i < take; i++) {
+                    carry[n + i] = seg[off + i];
+                }
+                n += take;
+                off += take;
+                if (n < 16) {
+                    continue;
+                }
+                for (int i = 0; i < 16; i++) {
+                    pt[i] = carry[i] ^ prev[i];
+                }
+                gy_aes_encrypt_block(&ak, pt, ct);
+                gy_copy(prev, ct, 16);
+                if (sel < 0) {
+                    /* 首块密文的前 16 字节之和 mod 3 决定本轮用哪种摘要 */
+                    for (int i = 0; i < 16; i++) {
+                        sum += ct[i];
+                    }
+                    sel = sum % 3;
+                    if (sel == 0) {
+                        gy_sha256_init(&c256);
+                    } else {
+                        if (sel == 1) {
+                            gy_sha384_init(&c512);
+                        } else {
+                            gy_sha512_init(&c512);
+                        }
+                    }
+                }
+                gy_copy(stage + stagen, ct, 16);
+                stagen += 16;
+                if (stagen == 128) {
+                    if (sel == 0) {
+                        gy_sha256_update(&c256, stage, 128);
+                    } else {
+                        gy_sha512_update(&c512, stage, 128);
+                    }
+                    stagen = 0;
+                }
+                last = ct[15];
+                n = 0;
+            }
+        }
+    }
+
+    if (sel < 0 || n != 0) {
+        return -1; /* 没凑出整块：参数非法 */
+    }
+    if (stagen > 0) {
+        if (sel == 0) {
+            gy_sha256_update(&c256, stage, stagen);
+        } else {
+            gy_sha512_update(&c512, stage, stagen);
+        }
+    }
+    if (sel == 0) {
+        gy_sha256_final(&c256, d256);
+        gy_copy(k, d256, 32);
+        *klen = 32;
+    } else if (sel == 1) {
+        gy_sha384_final(&c512, d384);
+        gy_copy(k, d384, 48);
+        *klen = 48;
+    } else {
+        gy_sha512_final(&c512, d512);
+        gy_copy(k, d512, 64);
+        *klen = 64;
+    }
+    return last;
+}
+
+/*
+ * Algorithm 2.A / 2.B：V=5 的口令哈希。
+ *
+ *   R=5（2.A）= SHA-256(pw ‖ 校验盐 ‖ udata)，一次即完成；
+ *   R=6（2.B）= 先按 2.A 求出 K，然后循环「AES 轮 → 摘要」至少 64 轮；
+ *              第 65 轮起，若本轮密文 E 的末字节大于「轮次 - 32」就继续，
+ *              上限 288 轮（规范给的安全上限）。
+ *
+ * out 固定 32 字节（ISO 32000-2 的校验值长度），成功返回 1。
+ */
+GY_HOSTDEV int gy_pdf_v5_hash(const uint8_t *pw, int pwlen, const uint8_t *salt, int saltlen,
+                              const uint8_t *udata, int udatalen, int r, uint8_t out[32]) {
+    uint8_t k[64];
+    int klen = 32;
+    GySHA256Ctx c;
+
+    gy_sha256_init(&c);
+    gy_sha256_update(&c, pw, pwlen);
+    gy_sha256_update(&c, salt, saltlen);
+    gy_sha256_update(&c, udata, udatalen);
+    gy_sha256_final(&c, k);
+
+    if (r < 6) {
+        gy_copy(out, k, 32);
+        return 1;
+    }
+    for (int round = 1; round <= GY_PDF_MAX_ROUNDS; round++) {
+        const int last = gy_pdf_v5_round(pw, pwlen, salt, saltlen, udata, udatalen, k, &klen);
+        if (last < 0) {
+            return 0;
+        }
+        if (round >= GY_PDF_MIN_ROUNDS && last <= round - 32) {
+            break;
+        }
+    }
+    gy_copy(out, k, 32);
+    return 1;
+}
+
+/* R=5/6（-m 10600/10700）：先校验用户口令，再用 /U 前 48 字节校验所有者口令 */
+GY_HOSTDEV int gy_pdf_v5_check(const uint8_t *pw, int pwlen, const uint8_t *u, const uint8_t *o,
+                               int r) {
+    uint8_t d[32];
+    static const uint8_t none[1] = {0};
+
+    if (r != 5 && r != 6) {
+        return 0;
+    }
+    if (pwlen < 0) {
+        return 0;
+    }
+    if (pwlen > 127) {
+        pwlen = 127; /* ISO 32000-2 规定口令只用前 127 字节，与 CPU 侧一致 */
+    }
+    /* 用户口令：盐取 /U 的校验盐(32..40)，udata 为空 */
+    if (!gy_pdf_v5_hash(pw, pwlen, u + 32, 8, none, 0, r, d)) {
+        return 0;
+    }
+    if (gy_memeq(d, u, 32)) {
+        return 1;
+    }
+    /* 所有者口令：盐取 /O 的校验盐(32..40)，udata 为 /U 前 48 字节 */
+    if (!gy_pdf_v5_hash(pw, pwlen, o + 32, 8, u, 48, r, d)) {
+        return 0;
+    }
+    return gy_memeq(d, o, 32);
+}
+
+
 /*
  * gy_generic_hash_check — 主机与 GPU 共用的通用哈希校验。
  *
@@ -1873,6 +2251,35 @@ GY_HOSTDEV int gy_generic_hash_check(int algo,
         return gy_wpa2_eapol_check((const uint8_t *)pw, pwlen, sp, saltlen,
                                    xp, extralen, cp, checklen, iter);
     }
+    if (algo == GYHOST_HASH_PDF) {
+        /*
+         * PDF 口令校验（hashcat -m 10400/10500/10600/10700）。
+         *
+         * V<=4（MD5 + RC4 标准安全处理器）：
+         *   Salt = ID[0](16 字节)、Data = /O(32)、Check = /U(32)、Iter = R、
+         *   KeyLen = 加密密钥字节数(5 或 16)、
+         *   IV = P(4 字节小端) || flags(1，bit0 = EncryptMetadata) || 保留(3)
+         * V=5（AES-256，Algorithm 2.A/2.B）：
+         *   Salt = 用户校验盐(8) || 所有者校验盐(8)、Data = /U(48)、Check = /O(48)、
+         *   Iter = R(5 或 6)
+         */
+        if (iter >= 5) {
+            if (saltlen != 16 || extralen != 48 || checklen != 48) {
+                return 0;
+            }
+            return gy_pdf_v5_check((const uint8_t *)pw, pwlen, xp, cp, iter);
+        }
+        if (saltlen != 16 || extralen != 32 || checklen != 32 || ivlen < 8) {
+            return 0;
+        }
+        const uint32_t p = (uint32_t)((const uint8_t *)iv)[0] |
+                           ((uint32_t)((const uint8_t *)iv)[1] << 8) |
+                           ((uint32_t)((const uint8_t *)iv)[2] << 16) |
+                           ((uint32_t)((const uint8_t *)iv)[3] << 24);
+        const int encmeta = (((const uint8_t *)iv)[4] & 1) ? 1 : 0;
+        return gy_pdf_legacy_check((const uint8_t *)pw, pwlen, sp, xp, cp,
+                                   p, encmeta, iter, keylen);
+    }
     return 0;
 }
 
@@ -1890,6 +2297,7 @@ int gyhost_hash_supported(int algo) {
         case GYHOST_HASH_7Z:
         case GYHOST_HASH_ZIPCRYPTO:
         case GYHOST_HASH_WPA2_EAPOL:
+        case GYHOST_HASH_PDF:
             return 1;
         default:
             return 0;

@@ -43,17 +43,31 @@ gyhost shadow -i /etc/shadow -m '?d?d?d?d'      # 掩码穷举，实时生成候
 - 候选来源二选一：`-p` 字典，或 `-m` 掩码（hashcat 风格表达式，见下）
 - 可选将结果以 `user:password` 写入文件
 
-### hashdump —— 加密压缩包 / 无线抓包哈希提取
+### hashdump —— 加密文件哈希提取
 
-从加密的 zip/7z/rar 压缩包，或 pcap/pcapng 无线抓包中提取可离线枚举的哈希，
-输出 hashcat 可直接使用的格式。
+从加密的压缩包、加密文档或无线抓包中提取可离线枚举的哈希，输出 hashcat 可直接使用的格式。
 
 ```bash
 gyhost hashdump -i secret.zip > hashes.txt
+gyhost hashdump -i report.pdf > pdf.hashes
+gyhost hashdump -i private.docx > office.hashes
 gyhost hashdump -i wifite/wifi-01.cap > wpa.hc22000
 ```
 
 - **压缩包**：zip（ZipCrypto `-m 17200`/`17210`、WinZip AES `-m 13600`）、7z（`-m 11600`，含文件名加密）、rar（RAR5 `-m 13000`，含头加密 `-hp`）
+- **加密 Office 文档**（OLE 复合文档；WPS 以兼容格式保存的文档同样支持）：
+  - OOXML agile 加密：`-m 9500`（SHA-1 / 2010）、`-m 9600`（SHA-512 / 2013+）
+  - OOXML 标准加密（2007 CryptoAPI）：`-m 9400`
+  - Word/Excel 97-2003：`$oldoffice$` → `-m 9700`（RC4+MD5）、`-m 9800`（RC4+SHA1）
+  - 输出与 john 的 `office2john` 逐字节一致，且不带它的 `:::` 后缀，可直接管道给 hashcat；已用 hashcat v7.1.2 实测可破
+  - 未加密文档、WPS 私有加密、PPT/Access 加密会明确说明跳过原因，不静默丢弃
+- **加密 PDF**（按 `/Encrypt` 的 V/R 自动选模式）：
+  - `-m 10400` V=1/R=2（RC4-40）、`-m 10500` V=2/R=3 与 V=4/R=4（RC4-128 / AES-128）
+  - `-m 10600` V=5/R=5（AES-256）、`-m 10700` V=5/R=6（AES-256 强化 KDF）
+  - 输出与 john 的 `pdf2john` 逐字节一致，已用 hashcat v7.1.2 实测可破
+  - 四种模式（10400/10500/10600/10700）都有 CUDA 内核，`hashac --gpu` 可直接用显卡枚举
+  - 目前 10400/10500/10600 默认走 GPU；10700（R=6 强化 KDF）的 GPU 内核虽已实现并有向量测试，
+    但实测比多线程 CPU 慢（约 1.4 kH/s 对 10.7 kH/s），故仍走 CPU，换 T-table 版 AES 后再放开
 - **无线抓包**（`-m 22000`，hc22000 格式，与 hcxtools 的 `hcxpcapngtool` 对齐）：
   - 抓包格式：pcap（含大小端与微秒/纳秒时间戳）、pcapng
   - 链路类型：802.11 / radiotap / Prism / AVS
@@ -69,6 +83,25 @@ hashcat -m 22000 wpa.hc22000 wordlist.txt
 gyhost hashdump -i wifi-01.cap | gyhost hashac -i /dev/stdin -p wordlist.txt
 ```
 
+### hashcat —— 算法识别与模式号
+
+不破解，只回答一个问题：**这是什么算法？该用 hashcat 的 `-m` 几？**
+
+```bash
+gyhost hashcat -i secret.zip              # 这个压缩包用了什么算法
+gyhost hashcat -i /etc/shadow             # shadow 里都是什么口令哈希
+gyhost hashcat --list                     # 只看算法 / 模式对照表
+```
+
+- **加密容器**（复用 `hashdump` 的解析器）：zip（ZipCrypto `-m 17200`/`17210`、WinZip AES `-m 13600`）、7z（`-m 11600`）、RAR5（`-m 13000`）、加密 PDF（`-m 10400`/`10500`/`10600`/`10700`）、Office/WPS 文档（`-m 9400`/`9500`/`9600`/`9700`/`9800`/`25300`）、无线抓包（`-m 22000`）
+- **哈希清单**（每行一条）：裸摘要 MD5/NTLM、SHA-1、SHA-256、SHA-512；口令哈希 `$1$`/`$apr1$`/`$5$`/`$6$`/`$2*$`/`$argon2*$`/`$scrypt$`/`$pbkdf2-sha256$`/`$y$`；Office 文档 `$office$`/`$oldoffice$`
+- 兼容 shadow 的 `user:hash:...` 与 hashcat potfile 的 `hash:密码` 行，条目名直接取用户名（附行号）
+- 每条输出「算法 / 模式 / 容器」三行，模式号可直接抄给 hashcat；结尾提示区分「容器需先 `hashdump` 导出」与「清单可直接使用」
+- 既不是容器也不是文本的输入（二进制文件）整份判为一条「无法解析」，不会退回逐行猜哈希刷屏；未加密/不支持的文档同样给出具体原因
+- 支持目录扫描（压缩包、文档、抓包与 `txt`/`hash`/`hashes` 清单）、`--list` 对照表与 `-q` 静默
+- 32 位十六进制在 MD5 与 NTLM 之间天然歧义，两个模式号都会给出；yescrypt（`$y$`）在 hashcat 中没有原生模式，只给算法名
+- 模式号已用本机 hashcat v7.1.2 的 `-hh` 输出逐条核对，含 Argon2 `-m 34000`、scrypt `-m 8900` 等 Generic KDF 模式
+
 ### hashac —— 常见哈希明文碰撞
 
 枚举常见哈希的明文碰撞，自动识别哈希类型。
@@ -79,10 +112,12 @@ gyhost hashac -i hashes.txt -m '?l?l?d?d'       # 掩码穷举，实时生成候
 ```
 
 - 裸摘要：MD5 / SHA-1 / SHA-256 / SHA-512
-- 复合格式：WPA2-PMKID/EAPOL（`-m 22000`）、RAR5（`-m 13000`）、ZIP-AES（`-m 13600`）、ZipCrypto（`-m 17200`/`17210`）、7z（`-m 11600`）
+- 复合格式：WPA2-PMKID/EAPOL（`-m 22000`）、RAR5（`-m 13000`）、ZIP-AES（`-m 13600`）、ZipCrypto（`-m 17200`/`17210`）、7z（`-m 11600`）、加密 PDF（`-m 10400`/`10500`/`10600`/`10700`）
 - 其中 `$...$` 格式可由 `hashdump` 直接从加密压缩包生成，两者可串联使用
+- 加密 PDF 的 `/U`（用户口令）与 `/O`（所有者口令）都会尝试——命中任一即可打开该 PDF；
+  已用 hashcat v7.1.2 的 10400/10500/10600/10700 逐条实测对齐（注意 hashcat 只校验用户口令）
 - 候选来源二选一：`-p` 字典，或 `-m` 掩码（hashcat 风格表达式，见下）
-- 支持 GPU 加速（`--gpu` 需 root/管理员）与并发
+- 支持 GPU 加速（`--gpu` 需 root/管理员）与并发；加密 PDF 的 10400/10500/10600 走 CUDA 内核（10700 见上）
 
 ## 掩码（暴力枚举）
 
@@ -138,6 +173,7 @@ go build -tags cuda -o gyhost .  # 带 GPU（需先 make -C internal/cuda）
 ./gyhost help            # 查看帮助
 ./gyhost help shadow     # 查看模块帮助
 ./gyhost help hashdump
+./gyhost help hashcat
 ./gyhost help hashac
 ```
 
@@ -154,6 +190,8 @@ sudo ./gyhost shadow -i /etc/shadow -p rockyou.txt --gpu -t 8   # GPU 需 root
 # hashdump：提取哈希（可直接管道给 hashcat）
 ./gyhost hashdump -i secret.zip > hashes.txt
 ./gyhost hashdump -i secret.7z -o hashes.txt -q
+./gyhost hashdump -i private.docx > office.hashes         # 加密 Word/WPS 文档
+./gyhost hashdump -i report.pdf > pdf.hashes              # 加密 PDF（用户/所有者口令都能破）
 ./gyhost hashdump -i /path/to/dir 2>/dev/null | sort -u > all.txt
 
 # hashac：碰撞（可接在 hashdump 之后）
@@ -161,6 +199,15 @@ sudo ./gyhost shadow -i /etc/shadow -p rockyou.txt --gpu -t 8   # GPU 需 root
 ./gyhost hashac -i hashes.txt -m '?l?l?l?l'              # 掩码穷举
 sudo ./gyhost hashac -i hashes.txt -p wordlist.txt --gpu -o cracked.txt   # GPU 需 root
 ./gyhost hashdump -i secret.rar -o hashes.txt && ./gyhost hashac -i hashes.txt -p wordlist.txt
+./gyhost hashdump -i report.pdf | ./gyhost hashac -i /dev/stdin -p wordlist.txt   # 加密 PDF
+
+# hashcat：识别算法并给出 -m 模式号
+./gyhost hashcat -i secret.zip                    # 容器里是什么算法
+./gyhost hashcat -i report.docx                   # 加密 Office/WPS 文档
+./gyhost hashcat -i hashes.txt -i /etc/shadow     # 哈希清单 / shadow 逐行识别
+./gyhost hashcat -i /path/to/dir                  # 批量分析整个目录
+./gyhost hashcat --list                           # 算法 / 模式对照表
+./gyhost hashcat -q -i hashes.txt                 # 静默：只看条目
 ```
 
 全局参数：`--help`、`--version`、`--no-banner`、`--no-color`。
@@ -181,6 +228,7 @@ GYhost/
 └── modules/         # 功能模块（当前均为 hash 方向）
     ├── shadow/
     ├── hashdump/
+    ├── hashcat/
     └── hashac/
 ```
 

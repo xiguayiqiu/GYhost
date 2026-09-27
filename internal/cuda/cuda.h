@@ -47,6 +47,7 @@ extern "C" {
 #define GYHOST_HASH_RAR5 130
 #define GYHOST_HASH_RAR3HP 131 /* RAR3 -hp 头加密（-m 12500） */
 #define GYHOST_HASH_7Z 140     /* 7z AES-256，仅 Copy 编码器（-m 11600 的子集） */
+#define GYHOST_HASH_PDF 150    /* 加密 PDF 口令校验（-m 10400/10500/10600/10700） */
 
 /*
  * 通用哈希各字段的长度上限（与 internal/cuda 的 MaxHash* 一致）。

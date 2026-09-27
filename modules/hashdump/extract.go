@@ -109,6 +109,11 @@ func Extract(path string) (*Result, error) {
 			return extractRAR5(f, size, path)
 		}
 		return nil, errors.New(i18n.Tf("hashdump.err.rar4", path))
+	case len(magic) >= 5 && string(magic[:5]) == string(magicPDF):
+		return extractPDF(f, size, path)
+	case len(magic) >= len(magicOLE) && string(magic[:len(magicOLE)]) == string(magicOLE):
+		// 加密的 OOXML 与 Word/Excel/PPT 老格式都是 OLE 复合文档
+		return extractOffice(f, size, path)
 	case isPCAPMagic(magic) || isPCAPNGMagic(magic):
 		return extractCapture(f, size, path)
 	default:
@@ -235,10 +240,16 @@ func (r *reader) eof() bool { return r.err != nil || r.off >= len(r.b) }
 // 路径解析
 // ---------------------------------------------------------------------------
 
-// inputExt 是目录扫描时接受的扩展名（压缩包与无线抓包）。
+// inputExt 是目录扫描时接受的扩展名（压缩包、加密文档与无线抓包）。
 var inputExt = map[string]bool{
 	".zip": true, ".zipx": true, ".7z": true, ".7za": true, ".rar": true,
 	".cap": true, ".pcap": true, ".pcapng": true,
+	".pdf": true,
+	// Office / WPS 文档（加密时同样是可提取口令哈希的容器）
+	".doc": true, ".docx": true, ".docm": true,
+	".xls": true, ".xlsx": true, ".xlsm": true,
+	".ppt": true, ".pptx": true, ".pps": true, ".ppsx": true,
+	".wps": true, ".et": true, ".dps": true,
 }
 
 // resolveInputs 展开输入列表：文件原样保留，目录按扩展名扫描。

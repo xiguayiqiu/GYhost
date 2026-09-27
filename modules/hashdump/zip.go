@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"gyhost/internal/i18n"
@@ -96,7 +97,29 @@ func extractZip(f io.ReaderAt, size int64, path string) (*Result, error) {
 			res.addSkip(e.name, i18n.Tf("hashdump.skip.method", fmt.Sprintf("%d", e.method)))
 		}
 	}
+
+	// 既没有可提取的哈希、也没有其它跳过原因时，说明这只是没加密的
+	// OOXML 文档（docx/xlsx/pptx 本身就是一个未加密的 zip），给个明确交代。
+	if len(res.Entries) == 0 && len(res.Skipped) == 0 && isOOXMLDoc(entries) {
+		res.addSkip(filepath.Base(path), i18n.T("hashdump.office.skip.no_encrypt"))
+	}
 	return res, nil
+}
+
+// isOOXMLDoc 判断 zip 是否是 Office Open XML 文档的容器。
+func isOOXMLDoc(entries []zipCD) bool {
+	var hasTypes, hasPart bool
+	for _, e := range entries {
+		if e.name == "[Content_Types].xml" {
+			hasTypes = true
+		}
+		if strings.HasPrefix(e.name, "word/") ||
+			strings.HasPrefix(e.name, "xl/") ||
+			strings.HasPrefix(e.name, "ppt/") {
+			hasPart = true
+		}
+	}
+	return hasTypes && hasPart
 }
 
 // extractZipCrypto 提取 ZipCrypto（传统 PKWARE 加密）条目。

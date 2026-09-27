@@ -15,6 +15,7 @@
 # 根目录可执行文件（make / go build 的输出）
 /gyhost
 /gyhost.exe
+/Test/
 
 # build.sh 生成的多平台发布产物
 /dist/

@@ -71,6 +71,24 @@ const (
 	// 前 KeyLen 字节的 CRC32 等于 Check（4 字节小端）。IV 为 16 字节初始向量。
 	// LZMA/Deflate 等需要解压校验的类型不适用，由 CPU 校验。
 	Hash7z = 140
+	// HashPDF 加密 PDF 的口令校验（hashcat -m 10400/10500/10600/10700）。
+	// 用户口令与所有者口令都会尝试（hashcat 只校验用户口令），命中任意一个即可。
+	// 字段布局随 V 分两套（与 cuda.cu 的 gy_generic_hash_check 注释一一对应）：
+	//
+	//	V<=4（MD5 + RC4 标准安全处理器）：
+	//	  Salt   = trailer /ID 的第一个元素（16 字节）
+	//	  Data   = /O（32 字节）
+	//	  Check  = /U（32 字节）
+	//	  Iter   = R（2..4）
+	//	  KeyLen = 加密密钥字节数（V=1 为 5，V=2/3/4 通常 16）
+	//	  IV     = P 的 4 字节小端 || flags（bit0 = /EncryptMetadata）|| 保留 3 字节
+	//
+	//	V=5（AES-256，ISO 32000-2）：
+	//	  Salt   = 用户校验盐 /U[32:40]（8 字节）|| 所有者校验盐 /O[32:40]（8 字节）
+	//	  Data   = /U（48 字节）
+	//	  Check  = /O（48 字节）
+	//	  Iter   = R（5 或 6）
+	HashPDF = 150
 )
 
 const (
@@ -265,6 +283,27 @@ func (t HashTarget) Validate() error {
 		if t.KeyLen <= 0 || t.KeyLen > len(t.Data) {
 			return ErrParam
 		}
+	case HashPDF:
+		// V<=4 与 V=5 两套字段布局，Iter（R）决定用哪套，见 HashPDF 注释。
+		if t.Iter >= 5 {
+			if (t.Iter != 5 && t.Iter != 6) || len(t.Salt) != 16 ||
+				len(t.Data) != 48 || len(t.Check) != 48 {
+				return ErrParam
+			}
+			break
+		}
+		if len(t.Salt) != 16 || len(t.Data) != 32 || len(t.Check) != 32 {
+			return ErrParam
+		}
+		if t.Iter < 2 || t.Iter > 4 {
+			return ErrParam
+		}
+		if t.KeyLen != 5 && t.KeyLen != 16 {
+			return ErrParam
+		}
+		if len(t.IV) != 8 { // P(4) || flags(1) || 保留(3)
+			return ErrParam
+		}
 	default:
 		return ErrUnsupported
 	}
@@ -279,7 +318,7 @@ func SupportedHash(algo int) bool {
 	switch algo {
 	case HashRawMD5, HashRawSHA1, HashRawSHA256, HashRawSHA512,
 		HashZIPAES, HashZipCrypto, HashWPA2PMKID, HashWPA2EAPOL,
-		HashRAR5, HashRAR3HP, Hash7z:
+		HashRAR5, HashRAR3HP, Hash7z, HashPDF:
 		return true
 	}
 	return false
