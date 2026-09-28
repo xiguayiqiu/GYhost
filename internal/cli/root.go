@@ -16,7 +16,7 @@ import (
 )
 
 // Version GYhost 版本号。
-const Version = "0.1.1"
+const Version = "0.1.2"
 
 // globalFlagList 根命令支持的全局参数（同时用于生成帮助信息）。
 // 文案取自 i18n，因此在打印时构造，随 LANG 切换语言。

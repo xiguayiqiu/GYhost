@@ -206,6 +206,7 @@ var messages = map[Lang]map[string]string{
 		"shadow.gpu.not_compiled":  "[!] 当前程序未启用 CUDA 编译，已回退 CPU 爆破（用 make 重新构建即可启用 GPU）",
 		"shadow.gpu.no_device":     "[!] 未检测到可用的 CUDA 设备，已回退 CPU 爆破",
 		"shadow.gpu.unsupported":   "[!] 目标哈希不支持 GPU（仅 $1$/$5$/$6$），已回退 CPU 爆破",
+		"shadow.gpu.warmup":        "[*] 正在唤醒 GPU 并提升核心频率（约 %s）…",
 		"shadow.gpu.runtime_error": "[!] GPU 校验出错，已回退 CPU 爆破: %s",
 		"shadow.report.gpu":        "[*] GPU 设备: %s（%s MB 显存）",
 
@@ -447,7 +448,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== hashac 模块 ====================
 		"hashac.group":   "本地分析",
-		"hashac.summary": "枚举 MD5/WPA2/RAR/ZIP/7z/PDF 等常见哈希的明文碰撞",
+		"hashac.summary": "枚举 MD5/WPA2/RAR/ZIP/7z/PDF/office 等常见哈希的明文碰撞",
 		"hashac.usage": `gyhost hashac - 枚举常见哈希的明文碰撞
 
 用法:
@@ -475,7 +476,9 @@ var messages = map[Lang]map[string]string{
   7z                             $7z$...（-m 11600）
   pdf                            $pdf$...（-m 10400/10500/10600/10700）
                                  V<=4 的 RC4/AES 与 V=5 的 AES-256，用户/所有者口令都试
-  其中 $... 格式可由 gyhost hashdump 直接从加密压缩包或加密 PDF 提取
+  office-2007 / 2010 / 2013      $office$...（-m 9400/9500/9600）
+                                 加密的 docx/xlsx/pptx（含 WPS 兼容保存）口令校验
+  其中 $... 格式可由 gyhost hashdump 直接从加密压缩包、加密 PDF 或加密 Office 文档提取
 
 输出:
   命中与统计 -> stdout，实时进度与提示 -> stderr（2>/dev/null 只看结果）
@@ -514,6 +517,9 @@ var messages = map[Lang]map[string]string{
 		"hashac.algo.pdf-aes-128":    "PDF AES-128",
 		"hashac.algo.pdf-aes-256":    "PDF AES-256",
 		"hashac.algo.pdf-aes-256-r6": "PDF AES-256（强化 KDF）",
+		"hashac.algo.office-2007":    "Office 2007",
+		"hashac.algo.office-2010":    "Office 2010",
+		"hashac.algo.office-2013":    "Office 2013",
 
 		// ---- hashac 错误 ----
 		"hashac.err.missing_args":  "缺少必填参数: -i [哈希文件]，以及 -p [密码字典] 或 -m [掩码] 之一",
@@ -523,6 +529,9 @@ var messages = map[Lang]map[string]string{
 		"hashac.err.mode":          "不支持的 hashcat 模式号: %d",
 		"hashac.err.pdf_version":   "不支持的 PDF 加密版本 V=%d R=%d",
 		"hashac.err.pdf_mode":      "该 PDF 哈希的 V/R 对应 -m %d，与 --mode %d 不符",
+		"hashac.err.office_year":   "不支持的 Office 加密版本年份 %d（仅支持 2007/2010/2013）",
+		"hashac.err.office_mode":   "该 Office 哈希对应 -m %d，与 --mode %d 不符",
+		"hashac.err.oldoffice":     "暂不支持 $oldoffice$（-m 9700/9800，Word/Excel 97-2003 的 RC4 口令校验）",
 		"hashac.err.open_input":    "无法读取哈希文件 %s",
 		"hashac.err.read_input":    "读取哈希文件失败",
 		"hashac.err.open_dict":     "打开密码字典失败",
@@ -540,6 +549,10 @@ var messages = map[Lang]map[string]string{
 		"hashac.gpu.not_compiled":  "[!] 当前程序未启用 CUDA 编译，已回退 CPU 爆破（用 make 重新构建即可启用 GPU）",
 		"hashac.gpu.no_device":     "[!] 未检测到可用的 CUDA 设备，已回退 CPU 爆破",
 		"hashac.gpu.unsupported":   "[!] 目标哈希不支持 GPU，已回退 CPU 爆破",
+		"hashac.gpu.note_r6":       "[*] -m 10700（PDF R=6 强化 KDF）的 GPU 内核比多线程 CPU 慢，已留在 CPU；设 GYHOST_PDF_R6_GPU=1 可强制用 GPU",
+		"hashac.gpu.note_7z":       "[*] 该 7z 条目用 LZMA/Deflate 压缩，GPU 只能校验 Copy 编码器，已留在 CPU",
+		"hashac.gpu.note_cipher":   "[*] 该条目的密文超过 GPU 上限（%d 字节），已留在 CPU",
+		"hashac.gpu.warmup":        "[*] 正在唤醒 GPU 并提升核心频率（约 %s）…",
 		"hashac.gpu.runtime_error": "[!] GPU 校验出错，已回退 CPU 爆破: %s",
 
 		// ---- hashac 实时进度 ----
@@ -674,6 +687,7 @@ Examples:
 		"shadow.gpu.not_compiled":  "[!] built without CUDA support, falling back to CPU (rebuild with make to enable GPU)",
 		"shadow.gpu.no_device":     "[!] no usable CUDA device found, falling back to CPU",
 		"shadow.gpu.unsupported":   "[!] target hashes are not GPU-capable ($1$/$5$/$6$ only), falling back to CPU",
+		"shadow.gpu.warmup":        "[*] Waking up the GPU and boosting its clocks (about %s)...",
 		"shadow.gpu.runtime_error": "[!] GPU verification failed, falling back to CPU: %s",
 
 		// ---- shadow report ----
@@ -919,7 +933,7 @@ Examples:
 
 		// ==================== hashac module ====================
 		"hashac.group":   "Local Analysis",
-		"hashac.summary": "Enumerate plaintext collisions for common hashes (MD5/WPA2/RAR/ZIP/7z/PDF)",
+		"hashac.summary": "Enumerate plaintext collisions for common hashes (MD5/WPA2/RAR/ZIP/7z/PDF/Office)",
 		"hashac.usage": `gyhost hashac - enumerate plaintext collisions for common hashes
 
 Usage:
@@ -947,7 +961,9 @@ Supported types (auto detected; hashcat mode in parentheses):
   7z                             $7z$... (-m 11600)
   pdf                            $pdf$... (-m 10400/10500/10600/10700)
                                  RC4/AES for V<=4 and AES-256 for V=5; tries user and owner passwords
-  the $... forms can be produced by "gyhost hashdump" from encrypted archives or PDFs
+  office-2007 / 2010 / 2013      $office$... (-m 9400/9500/9600)
+                                 password verifier for encrypted docx/xlsx/pptx (incl. WPS-compatible saves)
+  the $... forms can be produced by "gyhost hashdump" from encrypted archives, PDFs or Office documents
 
 Output:
   hits and summary -> stdout, live progress and notices -> stderr (2>/dev/null keeps hits only)
@@ -986,6 +1002,9 @@ Examples:
 		"hashac.algo.pdf-aes-128":    "PDF AES-128",
 		"hashac.algo.pdf-aes-256":    "PDF AES-256",
 		"hashac.algo.pdf-aes-256-r6": "PDF AES-256 (hardened KDF)",
+		"hashac.algo.office-2007":    "Office 2007",
+		"hashac.algo.office-2010":    "Office 2010",
+		"hashac.algo.office-2013":    "Office 2013",
 
 		// ---- hashac errors ----
 		"hashac.err.missing_args":  "missing required options: -i [hash file], plus either -p [wordlist] or -m [mask]",
@@ -995,6 +1014,9 @@ Examples:
 		"hashac.err.mode":          "unsupported hashcat mode number: %d",
 		"hashac.err.pdf_version":   "unsupported PDF encryption version V=%d R=%d",
 		"hashac.err.pdf_mode":      "this PDF hash maps V/R to -m %d, which conflicts with --mode %d",
+		"hashac.err.office_year":   "unsupported Office encryption year %d (only 2007/2010/2013 are supported)",
+		"hashac.err.office_mode":   "this Office hash maps to -m %d, which conflicts with --mode %d",
+		"hashac.err.oldoffice":     "$oldoffice$ is not supported (-m 9700/9800, RC4 password verifiers from Word/Excel 97-2003)",
 		"hashac.err.open_input":    "cannot read the hash file %s",
 		"hashac.err.read_input":    "failed to read the hash file",
 		"hashac.err.open_dict":     "failed to open the wordlist",
@@ -1012,6 +1034,10 @@ Examples:
 		"hashac.gpu.not_compiled":  "[!] this binary was built without CUDA, falling back to CPU (rebuild with make to enable the GPU)",
 		"hashac.gpu.no_device":     "[!] no usable CUDA device found, falling back to CPU",
 		"hashac.gpu.unsupported":   "[!] target hash is not supported on the GPU, falling back to CPU",
+		"hashac.gpu.note_r6":       "[*] the GPU kernel for -m 10700 (PDF R=6) is slower than the multi-threaded CPU, keeping it on CPU; set GYHOST_PDF_R6_GPU=1 to force the GPU",
+		"hashac.gpu.note_7z":       "[*] this 7z entry uses LZMA/Deflate; the GPU kernel only handles the Copy coder, keeping it on CPU",
+		"hashac.gpu.note_cipher":   "[*] this entry's ciphertext exceeds the GPU limit (%d bytes), keeping it on CPU",
+		"hashac.gpu.warmup":        "[*] Waking up the GPU and boosting its clocks (about %s)...",
 		"hashac.gpu.runtime_error": "[!] GPU verification failed, falling back to CPU: %s",
 
 		// ---- hashac live progress ----

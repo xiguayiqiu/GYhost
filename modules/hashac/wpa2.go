@@ -109,6 +109,9 @@ func wpa2PTK(keyver int, pmk, sta, ap, snonce, anonce []byte) []byte {
 		b.Write(snonce)
 	}
 
+	// 末尾这个 0x00 是 PRF 的块计数器 i（i=0）：hashcat 的 module_22000 先拼出 99 字节的
+	// pke（"Pairwise key expansion\x00" + MAC + nonce），再由 hmac_sha1_generic 追加计数器，
+	// 等价于 HMAC-SHA1(PMK, pke || 0x00) 的前 20 字节。keyver 3 走 802.11w 的 0x80 0x01 结束标记。
 	var prf []byte
 	if legacy {
 		b.WriteByte(0)

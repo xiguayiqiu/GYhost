@@ -15,10 +15,14 @@
 package cuda
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf16"
 )
 
@@ -89,6 +93,19 @@ const (
 	//	  Check  = /O（48 字节）
 	//	  Iter   = R（5 或 6）
 	HashPDF = 150
+	// HashOffice 加密 Office 文档的口令校验（hashcat -m 9400/9500/9600，
+	// 哈希行 $office$*2007/2010/2013）。候选口令按 UTF-16LE 编码下发，
+	// 最多 127 个码元（254 字节），更长的由 CPU 校验。字段布局：
+	//
+	//	  Salt   = 盐（16 字节；2010/2013 兼作 AES-CBC 的 IV）
+	//	  Data   = LE32(年份 2007/2010/2013) || LE32(verifierHashSize，仅 2007 用，
+	//	           2010/2013 置 0) || 加密校验值（16 字节），共 24 字节
+	//	  Check  = 加密校验哈希（2007 ≥16 字节；2010/2013 需 32 字节）
+	//	  Iter   = KDF 轮数（2007 恒为 50000，即 [MS-OFFCRYPTO] 2.3.4 的定值）
+	//	  KeyLen = AES 密钥字节数（16/24/32，来自哈希的密钥位数）
+	//
+	// 2007 是 SHA-1 KDF + AES-ECB，2010/2013 是 SHA-1/SHA-512 KDF + AES-CBC。
+	HashOffice = 160
 )
 
 const (
@@ -127,6 +144,15 @@ var (
 	ErrPasswordTooLong = errors.New("cuda: password exceeds MaxPasswordLen")
 	// ErrRuntime CUDA 运行期错误（显存分配、内核发射失败）。
 	ErrRuntime = errors.New("cuda: runtime error")
+)
+
+// asyncAlive 持有最近一批异步提交的候选缓冲，VerifyHashEnd 时删除。
+// 现在 native 会先把数据拷进页锁定缓冲才返回，正常情况下不依赖它；
+// 保留是为了避免将来改回「直接引用 Go 内存」时埋下悬垂引用的坑。
+// 键为 device*16+槽位句柄。
+var (
+	asyncAliveMu sync.Mutex
+	asyncAlive   = map[int][]byte{}
 )
 
 // Device 描述一块可用的 CUDA 设备。
@@ -202,8 +228,22 @@ const (
 	MaxHashDataLen = 384
 	// MaxHashCheckLen 目标校验值的最大字节数。
 	MaxHashCheckLen = 64
+	// MaxCipherDataLen 需要整段下发的密文类算法（WinZip AES -m 13600、7z AES）的上限。
+	// 它们的认证码/CRC 覆盖整段密文，内核必须把密文完整解密一遍；384 字节的通用上限
+	// 会让几乎所有真实条目都静默退回 CPU。ZipCrypto 只用 12 字节加密头，不受此限制。
+	// 仍超出的条目回退 CPU。必须与 C 侧 GYHOST_HASH_MAX_CIPHER_DATA 一致。
+	MaxCipherDataLen = 1 << 20
+	// MaxEAPOLDataLen WPA2 四次握手（-m 22000 的 WPA*02*）Data 的上限：
+	// Data = MAC 块(12) + ANonce(32) + EAPOL 帧。内核对整帧做 HMAC/MIC，
+	// 帧本身要完整下发；真实抓包的 M2/M4 常见 100~1500 字节（M4 带厂商 IE 时更大），
+	// 所以同样不能套 384 字节的通用上限。必须与 C 侧 GYHOST_HASH_MAX_EAPOL_DATA 一致。
+	MaxEAPOLDataLen = 1 << 16
 	// MaxHashIter 允许的最大 KDF 迭代轮数（power 形式的上限见各算法）。
 	MaxHashIter = 1 << 24
+	// officeEncHashLen Office 2010/2013 必须下发的加密校验哈希字节数：
+	// 两个 AES 分组，比对时只用前 officeCompareLen(20) 字节，但少了第二组
+	// 就拿不到摘要的第 17~20 字节。
+	officeEncHashLen = 32
 )
 
 // HashTarget 描述一个可在 GPU 上校验的通用哈希（hashac 模块使用）。
@@ -243,7 +283,9 @@ func (t HashTarget) Validate() error {
 		if t.KeyLen != 16 && t.KeyLen != 24 && t.KeyLen != 32 {
 			return ErrParam
 		}
-		if len(t.Check) != 12 || len(t.Data) == 0 {
+		// Data 是整段密文（认证码覆盖它）：不能为空——空密文的条目（比如加密的空文件）
+		// 只剩 2 字节口令校验值可判，parseZIPAES 会选择不挂 GPU 目标
+		if len(t.Check) != 12 || len(t.Data) == 0 || len(t.Data) > MaxCipherDataLen {
 			return ErrParam
 		}
 	case HashWPA2PMKID:
@@ -251,7 +293,8 @@ func (t HashTarget) Validate() error {
 			return ErrParam
 		}
 	case HashZipCrypto:
-		if len(t.Check) != 4 || len(t.Data) <= 12 {
+		// Data 只放 12 字节加密头（内核的弱校验只需要它）
+		if len(t.Check) != 4 || len(t.Data) < 12 {
 			return ErrParam
 		}
 		if t.Iter != 1 && t.Iter != 2 {
@@ -259,7 +302,9 @@ func (t HashTarget) Validate() error {
 		}
 	case HashWPA2EAPOL:
 		// Data = MAC块(12) + ANonce(32) + EAPOL 帧，帧长至少到 MIC 结束（97）。
-		if len(t.Check) != 16 || len(t.Data) < 44+97 {
+		// 真实抓包里 M2/M4 常带大量 IE/厂商字段，帧长轻松上千字节，
+		// 所以这里用专门的上限（见 MaxEAPOLDataLen），不能套 384 字节的通用上限。
+		if len(t.Check) != 16 || len(t.Data) < 44+97 || len(t.Data) > MaxEAPOLDataLen {
 			return ErrParam
 		}
 		if t.Iter < 1 || t.Iter > 3 {
@@ -277,7 +322,8 @@ func (t HashTarget) Validate() error {
 		if len(t.Check) != 4 || len(t.IV) != 16 || t.Iter < 0 || t.Iter > 24 {
 			return ErrParam
 		}
-		if len(t.Data) == 0 || len(t.Data) > MaxHashDataLen || len(t.Data)%16 != 0 {
+		// 内核要整段解密，Data 允许很大（与 WinZip AES 同理单独放宽上限）
+		if len(t.Data) == 0 || len(t.Data) > MaxCipherDataLen || len(t.Data)%16 != 0 {
 			return ErrParam
 		}
 		if t.KeyLen <= 0 || t.KeyLen > len(t.Data) {
@@ -304,11 +350,52 @@ func (t HashTarget) Validate() error {
 		if len(t.IV) != 8 { // P(4) || flags(1) || 保留(3)
 			return ErrParam
 		}
+	case HashOffice:
+		// 字段布局见 HashOffice 注释；年份决定用哪套算法，无法支持的年份直接拒绝。
+		if len(t.Salt) != 16 || len(t.Data) != 24 || t.Iter < 0 || t.Iter > MaxHashIter {
+			return ErrParam
+		}
+		if t.KeyLen != 16 && t.KeyLen != 24 && t.KeyLen != 32 {
+			return ErrParam
+		}
+		year := int(binary.LittleEndian.Uint32(t.Data[0:4]))
+		switch year {
+		case 2007:
+			// field2 = verifierHashSize，决定 DeriveKey 要不要第二段 0x5C 填充
+			if hashLen := int(binary.LittleEndian.Uint32(t.Data[4:8])); hashLen <= 0 || hashLen > 64 {
+				return ErrParam
+			}
+			if len(t.Check) < 16 {
+				return ErrParam
+			}
+		case 2010, 2013:
+			// agile：要解两个 AES 分组才能比对摘要前 20 字节
+			if len(t.Check) < officeEncHashLen {
+				return ErrParam
+			}
+		default:
+			return ErrParam
+		}
 	default:
 		return ErrUnsupported
 	}
-	if len(t.Salt) > MaxHashSaltLen || len(t.Data) > MaxHashDataLen || len(t.Check) > MaxHashCheckLen {
+	if len(t.Salt) > MaxHashSaltLen || len(t.Check) > MaxHashCheckLen {
 		return ErrParam
+	}
+	// 超过通用上限的只有"必须整段下发"的算法：WinZip AES / 7z 的密文、WPA2 的 EAPOL 帧
+	if len(t.Data) > MaxHashDataLen {
+		switch t.Algo {
+		case HashZIPAES, Hash7z:
+			if len(t.Data) > MaxCipherDataLen {
+				return ErrParam
+			}
+		case HashWPA2EAPOL:
+			if len(t.Data) > MaxEAPOLDataLen {
+				return ErrParam
+			}
+		default:
+			return ErrParam
+		}
 	}
 	return nil
 }
@@ -318,7 +405,7 @@ func SupportedHash(algo int) bool {
 	switch algo {
 	case HashRawMD5, HashRawSHA1, HashRawSHA256, HashRawSHA512,
 		HashZIPAES, HashZipCrypto, HashWPA2PMKID, HashWPA2EAPOL,
-		HashRAR5, HashRAR3HP, Hash7z, HashPDF:
+		HashRAR5, HashRAR3HP, Hash7z, HashPDF, HashOffice:
 		return true
 	}
 	return false
@@ -356,10 +443,21 @@ func utf16le(pw string) []byte {
 	return out
 }
 
+// utf16Encoded 报告该算法的候选口令是否要按 UTF-16LE 编码再下发
+// （内核拿到的就是编码后的字节流，pw_len 为编码后的字节数）。
+func utf16Encoded(algo int) bool {
+	switch algo {
+	case HashRAR3HP, Hash7z, HashOffice:
+		return true
+	}
+	return false
+}
+
 // HashPasswordFits 判断候选密码能否交给 GPU 按该算法校验。
 //
 // 通用上限是 len(pw) <= MaxPasswordLen；RAR3-hp 额外要求不超过 64 个
-// UTF-16 码元、7z 不超过 127 个（native 侧缓冲区大小约束）。
+// UTF-16 码元、7z 与 Office 不超过 127 个（native 侧缓冲区大小约束，
+// 编码后 254 字节，仍小于 GY_MAX_PW=255）。
 // 不满足的候选由调用方回退 CPU 校验。
 func HashPasswordFits(algo int, pw string) bool {
 	if len(pw) > MaxPasswordLen {
@@ -368,7 +466,7 @@ func HashPasswordFits(algo int, pw string) bool {
 	switch algo {
 	case HashRAR3HP:
 		return utf16Units(pw) <= 64
-	case Hash7z:
+	case Hash7z, HashOffice:
 		return utf16Units(pw) <= 127
 	}
 	return true
@@ -499,8 +597,11 @@ func Check(t Target, password string) (bool, error) {
 // VerifyHash 在指定设备上批量校验通用哈希目标，返回首个命中的候选下标（无命中为 -1）。
 //
 // 与 Verify 相同，一批候选共享同一个目标；并发安全，每次调用独立申请显存。
-// RAR3-hp / 7z 的候选密码会先按 UTF-16LE 编码再下发，返回的下标仍对应
+// RAR3-hp / 7z / Office 的候选密码会先按 UTF-16LE 编码再下发，返回的下标仍对应
 // 原始 passwords 切片。
+//
+// 需要让 GPU 与主机并行（喂下一批时上一批还在跑）请用 VerifyHashAsync +
+// VerifyHashEnd 这对异步接口。
 func VerifyHash(t HashTarget, passwords []string, device int) (int, error) {
 	if !compiled() {
 		return -1, ErrNotCompiled
@@ -517,29 +618,159 @@ func VerifyHash(t HashTarget, passwords []string, device int) (int, error) {
 	if device < 0 {
 		return -1, ErrParam
 	}
-
-	if t.Algo == HashRAR3HP || t.Algo == Hash7z {
-		cvt := make([]string, len(passwords))
-		for i, pw := range passwords {
-			if !HashPasswordFits(t.Algo, pw) {
-				return -1, ErrPasswordTooLong
-			}
-			cvt[i] = string(utf16le(pw))
-		}
-		passwords = cvt
-	}
-
-	data, offs, lens, err := flatten(passwords)
+	data, offs, lens, err := prepare(t, passwords)
 	if err != nil {
 		return -1, err
 	}
 	return verifyHashNative(t.Algo, data, offs, lens, t.Salt, t.Data, t.Check, t.IV, t.Iter, t.KeyLen, device)
 }
 
+/*
+ * VerifyHashAsync / VerifyHashEnd — 异步流水线接口。
+ *
+ * VerifyHashAsync 把候选拍平、上传并发射内核后立即返回槽位句柄；
+ * VerifyHashEnd 等该批内核结束并读回首个命中下标（无命中为 -1）。
+ * 两次调用之间主机可以做下一批的准备工作，GPU 不必空等。
+ *
+ * 注意：异步路径不做「命中即停」的分块提前结束——整批候选都会算完
+ * （命中最小子标由设备端 atomicMin 保证正确）。对命中率极低的爆破场景
+ * 这点浪费可以忽略，换来的是主机与设备的并行。
+ */
+func VerifyHashAsync(t HashTarget, passwords []string, device int) (int, error) {
+	if !compiled() {
+		return -1, ErrNotCompiled
+	}
+	if err := t.Validate(); err != nil {
+		return -1, err
+	}
+	if len(passwords) == 0 {
+		return -1, ErrParam
+	}
+	if len(passwords) > MaxBatch {
+		return -1, ErrParam
+	}
+	if device < 0 {
+		return -1, ErrParam
+	}
+	data, offs, lens, err := prepare(t, passwords)
+	if err != nil {
+		return -1, err
+	}
+	h, err := verifyHashBeginNative(t.Algo, data, offs, lens, t.Salt, t.Data, t.Check, t.IV, t.Iter, t.KeyLen, device)
+	if err != nil {
+		return -1, err
+	}
+	// native 侧已把候选拷进页锁定缓冲，这里保留引用只是兜底：
+	// 一旦将来改成直接引用 Go 内存，VerifyHashEnd 之前都不能让底层数组被回收。
+	asyncAliveMu.Lock()
+	asyncAlive[device*16+h] = data
+	asyncAliveMu.Unlock()
+	return h, nil
+}
+
+// VerifyHashEnd 取回 VerifyHashAsync 提交的那批的结果。
+func VerifyHashEnd(handle, device int) (int, error) {
+	if !compiled() {
+		return -1, ErrNotCompiled
+	}
+	if handle < 0 || device < 0 {
+		return -1, ErrParam
+	}
+	idx, err := verifyHashEndNative(handle, device)
+	asyncAliveMu.Lock()
+	delete(asyncAlive, device*16+handle)
+	asyncAliveMu.Unlock()
+	return idx, err
+}
+
+/*
+ * crypt 目标（shadow 模块）的异步流水线接口。
+ *
+ * VerifyAsync 把候选拍平、上传并发射内核后立即返回批次句柄；
+ * VerifyEnd 等该批完成并读回首个命中下标（无命中为 -1）。
+ * 两次调用之间主机可以做下一批的准备工作，GPU 不必空等——这是让
+ * --gpu 跑满（而不是一批一等）的关键。
+ */
+func VerifyAsync(t Target, passwords []string, device int) (int, error) {
+	if !compiled() {
+		return -1, ErrNotCompiled
+	}
+	if err := t.Validate(); err != nil {
+		return -1, err
+	}
+	if len(passwords) == 0 {
+		return -1, ErrParam
+	}
+	if len(passwords) > MaxBatch {
+		return -1, ErrParam
+	}
+	if device < 0 {
+		return -1, ErrParam
+	}
+	data, offs, lens, err := flatten(passwords)
+	if err != nil {
+		return -1, err
+	}
+	h, err := verifyBeginNative(t.Algo, data, offs, lens, t.Salt, t.Rounds, t.Key, device)
+	if err != nil {
+		return -1, err
+	}
+	// 同 VerifyHashAsync：native 侧已拷进页锁定缓冲，这里只是兜底持有引用。
+	asyncAliveMu.Lock()
+	asyncAlive[device*16+h] = data
+	asyncAliveMu.Unlock()
+	return h, nil
+}
+
+// VerifyEnd 取回 VerifyAsync 提交的那批的结果。
+func VerifyEnd(handle, device int) (int, error) {
+	if !compiled() {
+		return -1, ErrNotCompiled
+	}
+	if handle < 0 || device < 0 {
+		return -1, ErrParam
+	}
+	idx, err := verifyEndNative(handle, device)
+	asyncAliveMu.Lock()
+	delete(asyncAlive, device*16+handle)
+	asyncAliveMu.Unlock()
+	return idx, err
+}
+
+// PipelineSlots 返回异步流水线可同时在飞的批次数上限。
+//
+// 调用方应据此确定 in-flight 批次的环大小：需要同时在飞的批次超过这个数时，
+// 提交会在 native 的 begin 里阻塞等最老的槽位完成，这段时间主机既不能准备
+// 下一批、GPU 也没有新内核可跑，利用率会明显下降。
+func PipelineSlots() int {
+	if !compiled() {
+		return 0
+	}
+	return pipelineSlotsNative()
+}
+
+/*
+ * prepare 拍平候选并按算法做 UTF-16LE 编码（RAR3-hp / 7z / Office）。
+ * 超长候选在这里就被拒绝，不进入拍平循环。
+ */
+func prepare(t HashTarget, passwords []string) (data []byte, offs, lens []int32, err error) {
+	if utf16Encoded(t.Algo) {
+		cvt := make([]string, len(passwords))
+		for i, pw := range passwords {
+			if !HashPasswordFits(t.Algo, pw) {
+				return nil, nil, nil, ErrPasswordTooLong
+			}
+			cvt[i] = string(utf16le(pw))
+		}
+		passwords = cvt
+	}
+	return flatten(passwords)
+}
+
 // CheckHash 使用主机端（CPU）参考实现校验单个密码。
 //
 // 它与 GPU 内核共用 cuda.cu 中的同一套算法代码，用于一致性自检与调试，
-// 不会访问 GPU。RAR3-hp / 7z 的密码按 UTF-16LE 编码后传入。
+// 不会访问 GPU。RAR3-hp / 7z / Office 的密码按 UTF-16LE 编码后传入。
 func CheckHash(t HashTarget, password string) (bool, error) {
 	if !compiled() {
 		return false, ErrNotCompiled
@@ -550,7 +781,7 @@ func CheckHash(t HashTarget, password string) (bool, error) {
 	if !HashPasswordFits(t.Algo, password) {
 		return false, ErrPasswordTooLong
 	}
-	if t.Algo == HashRAR3HP || t.Algo == Hash7z {
+	if utf16Encoded(t.Algo) {
 		password = string(utf16le(password))
 	}
 	rc, err := checkHashNative(t.Algo, password, t.Salt, t.Data, t.Check, t.IV, t.Iter, t.KeyLen)
@@ -558,6 +789,91 @@ func CheckHash(t HashTarget, password string) (bool, error) {
 		return false, err
 	}
 	return rc == 1, nil
+}
+
+/*
+ * GPU 唤醒（预热）。
+ *
+ * 消费级显卡空载时会自动降频休眠（实测 RTX 3050 Laptop 空载 P8 / 210MHz，
+ * 满载 P0 / 约 2000MHz）。NVIDIA 驱动只对「持续」的负载提频：如果破解时
+ * 内核之间有几十微秒以上的空档（主机准备下一批、读回结果），核心频率会一直
+ * 停在低档甚至中途回落，表现就是「越跑越慢、速度远低于 hashcat」。
+ *
+ * 这里的做法是开跑前用真实目标连续打满 WarmUpDuration，让驱动把频率拉到
+ * 最高；同时顺带完成内核的首次加载/JIT，正式爆破的第一批不会再额外卡顿。
+ */
+
+// WarmUpDuration 预热 GPU 的默认时长。
+const WarmUpDuration = 400 * time.Millisecond
+
+// warmUpCandidates 每次预热批次的候选数（够大才能吃满 GPU）。
+const warmUpCandidates = 1 << 16
+
+// warmUpBatch 生成预热用候选（内容无意义，只要长度合法、数量足够）。
+func warmUpBatch(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "warmup" + strconv.Itoa(i)
+	}
+	return out
+}
+
+// WarmUp 在开始爆破前让设备连续满载一小段时间，把它从低功耗状态唤醒。
+//
+// 参数 t 是即将爆破的真实目标（预热用同一套内核，顺便触发首次加载）；
+// device 为设备编号；d 为预热时长（<= 0 表示不预热）。
+// 返回错误时调用方应把它当成「GPU 不可用」，回退 CPU 爆破。
+func WarmUp(t Target, device int, d time.Duration) error {
+	if !compiled() {
+		return ErrNotCompiled
+	}
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	batch := warmUpBatch(warmUpCandidates)
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if _, err := Verify(t, batch, device); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WarmUpHash 与 WarmUp 相同，用于通用哈希目标（hashac 模块）。
+//
+// 预热候选会按目标算法的长度上限过滤（RAR3-hp / 7z / Office 按 UTF-16
+// 码元算），过滤后为空时返回 ErrPasswordTooLong。
+func WarmUpHash(t HashTarget, device int, d time.Duration) error {
+	if !compiled() {
+		return ErrNotCompiled
+	}
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	batch := warmUpBatch(warmUpCandidates)
+	fit := batch[:0]
+	for _, pw := range batch {
+		if HashPasswordFits(t.Algo, pw) {
+			fit = append(fit, pw)
+		}
+	}
+	if len(fit) == 0 {
+		return ErrPasswordTooLong
+	}
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if _, err := VerifyHash(t, fit, device); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // errFromCode 把 cuda.h 的返回码翻译成公共错误。

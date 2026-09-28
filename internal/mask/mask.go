@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"sync"
 )
 
 // 标准字符集。
@@ -138,6 +139,94 @@ func (m *Mask) Each(fn func(string) bool) {
 		}
 		if p < 0 {
 			return // 已枚举完
+		}
+	}
+}
+
+/*
+ * EachParallel 把候选空间切成 n 段，用 n 个协程并行枚举，通过 emit 产出候选。
+ *
+ * emit 会被多个协程并发调用，实现方必须自行保证线程安全（例如每个协程攒自己的
+ * 批，再发送到带缓冲的通道）。段边界按候选总数均分，各段独立做里程表递增，
+ * 因此整体不保证全局顺序——对爆破来说顺序无所谓，只要不重不漏。
+ *
+ * n <= 1 或候选数太少时退化为单协程的 Each。
+ */
+func (m *Mask) EachParallel(n int, emit func(string)) {
+	if n <= 1 {
+		m.Each(func(pw string) bool {
+			emit(pw)
+			return true
+		})
+		return
+	}
+	if m.size < uint64(n) {
+		n = int(m.size)
+	}
+	if n <= 1 {
+		m.Each(func(pw string) bool {
+			emit(pw)
+			return true
+		})
+		return
+	}
+
+	var wg sync.WaitGroup
+	for s := 0; s < n; s++ {
+		lo := m.size * uint64(s) / uint64(n)
+		hi := m.size * uint64(s+1) / uint64(n)
+		if lo >= hi {
+			continue
+		}
+		wg.Add(1)
+		go func(lo, hi uint64) {
+			defer wg.Done()
+			m.rangeEach(lo, hi, emit)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+// startIdx 把「第 offset 个候选」换算成里程表下标（最高位在左）。
+func (m *Mask) startIdx(offset uint64) []int {
+	n := len(m.sets)
+	idx := make([]int, n)
+	rem := offset
+	for i := 0; i < n; i++ {
+		stride := uint64(1)
+		for j := i + 1; j < n; j++ {
+			stride *= uint64(len(m.sets[j]))
+		}
+		idx[i] = int(rem / stride)
+		rem %= stride
+	}
+	return idx
+}
+
+// rangeEach 枚举候选空间里 [lo, hi) 的半开区间（下标由 startIdx 换算）。
+func (m *Mask) rangeEach(lo, hi uint64, emit func(string)) {
+	n := len(m.sets)
+	idx := m.startIdx(lo)
+	buf := make([]byte, n)
+	total := hi - lo
+
+	for done := uint64(0); done < total; done++ {
+		for i := 0; i < n; i++ {
+			buf[i] = m.sets[i][idx[i]]
+		}
+		emit(string(buf))
+
+		p := n - 1
+		for p >= 0 {
+			idx[p]++
+			if idx[p] < len(m.sets[p]) {
+				break
+			}
+			idx[p] = 0
+			p--
+		}
+		if p < 0 {
+			return
 		}
 	}
 }

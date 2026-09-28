@@ -32,6 +32,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"hash"
+	"os"
 	"strconv"
 	"strings"
 
@@ -320,17 +321,27 @@ func (c *pdfAES256Checker) Check(pw string) bool {
 	return hmac.Equal(pdfHashV5(p, c.o[32:40], c.u[:48], c.r), c.o[:32])
 }
 
+// pdfR6ForceGPU 读环境变量 GYHOST_PDF_R6_GPU：设成 1/true/yes/on 时，
+// 即使 R=6 的 GPU 内核比 CPU 慢也照样交给 GPU（例如换了更强的显卡）。
+func pdfR6ForceGPU() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GYHOST_PDF_R6_GPU"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // gpu 给出该校验器对应的 GPU 目标（字段布局见 cuda.HashPDF）；
 // /U /O 不足 48 字节时（所有者口令路径要 /U 前 48 字节）返回 nil 回退 CPU。
 //
-// R=6（-m 10700）故意返回 nil：内核本身是好的（internal/cuda 里有向量测试直接跑它），
-// 但每个候选要做 64~288 轮 AES-128-CBC，实测在本机 RTX 3050 上约 1.4 kH/s，
-// 而 16 线程 CPU 约 10.7 kH/s——GPU 反而慢 7 倍，所以默认仍走 CPU。
+// R=6（-m 10700）默认返回 nil：内核本身是好的（internal/cuda 里有向量测试直接跑它），
+// 但每个候选要做 64~288 轮 AES-128-CBC，实测在本机 RTX 3050 上约 1.0 kH/s，
+// 而 16 线程 CPU 约 10.7 kH/s——GPU 反而慢一个数量级，所以默认仍走 CPU。
 // 差距的来源：内核用的 AES 是按字节实现的（与 hashac 的 CPU 版逐字节对应），
-// 且比 hashcat 多算一遍所有者口令路径。等换成 T-table 版 AES 之后，
-// 把这里改回返回目标即可，别的都不用动。
+// 且比 hashcat 多算一遍所有者口令路径。设 GYHOST_PDF_R6_GPU=1 可强制交给 GPU；
+// 内核换成 T-table 版 AES 之后，把下面的开关删掉即可。
 func (c *pdfAES256Checker) gpu() *cuda.HashTarget {
-	if c.r != 5 { // 见上：R=6 的 GPU 内核暂时比不过多线程 CPU
+	if c.r != 5 && !pdfR6ForceGPU() {
 		return nil
 	}
 	if len(c.u) < 48 || len(c.o) < 48 {

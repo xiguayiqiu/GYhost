@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,10 +92,42 @@ func (r *Report) Speed() float64 {
 }
 
 // target 一个运行期的待爆破目标。
+// target 一个待爆破目标及其运行时状态。
 type target struct {
 	t        *Target
 	cracked  atomic.Bool
 	attempts atomic.Int64
+	// note 说明"为什么这个目标没走 GPU"，非空时由 planGPU 提示一次（便于定位
+	// 静默回退 CPU 的原因，例如 7z 的 LZMA 条目、PDF 的 R=6）
+	note string
+	// lastSend 最近一批交给异步 GPU 的候选（按原顺序），供 VerifyHashEnd
+	// 返回下标后回查口令；仅单 GPU 目标的流水线路径使用。
+	lastSend []string
+}
+
+// gpuNote 说明某个"只能走 CPU"的目标的具体原因，供 planGPU 提示一次。
+//
+// 没有 GPU 目标的原因有好几种，一句"不支持 GPU"解释不了：
+//   - PDF R=6：内核有，但比多线程 CPU 慢（见 pdfAES256Checker.gpu）；
+//   - 7z 的 LZMA/Deflate 条目：内核只能校验 Copy 编码器（需要解压）；
+//   - 密文超过 GPU 上限（WinZip AES / 7z 都要整段下发）。
+func gpuNote(t *Target) string {
+	if t == nil || t.GPU != nil {
+		return ""
+	}
+	switch c := t.Check.(type) {
+	case *pdfAES256Checker:
+		if c.r == 6 {
+			return i18n.T("hashac.gpu.note_r6")
+		}
+	case *sevenZipChecker:
+		if c.datatype != z7Copy {
+			return i18n.T("hashac.gpu.note_7z")
+		}
+	case *zipAESChecker:
+		return i18n.Tf("hashac.gpu.note_cipher", cuda.MaxCipherDataLen)
+	}
+	return ""
 }
 
 // wordBatch 一批候选密码；同一批会同时投递给 GPU 与 CPU 消费者，
@@ -120,7 +153,9 @@ type session struct {
 
 	checked   atomic.Int64
 	resultsMu sync.Mutex
-	results   []Result
+	// pendingT 在飞异步批次所属的目标（单 GPU 目标流水线路径），供收尾时回查。
+	pendingT *target
+	results  []Result
 }
 
 // hit 记录一次命中（并发安全）：登记结果、打印、必要时立即收工。
@@ -140,6 +175,19 @@ func (s *session) hit(t *target, password string) {
 	})
 	if allCracked(s.targets) {
 		s.cancel()
+	}
+}
+
+// cpuCheck 用 CPU 校验单个候选集，命中即登记。
+func (s *session) cpuCheck(t *target, cands []string) {
+	if t.cracked.Load() || len(cands) == 0 {
+		return
+	}
+	for _, pw := range cands {
+		if t.t.Check.Check(pw) {
+			s.hit(t, pw)
+			return
+		}
 	}
 }
 
@@ -186,7 +234,7 @@ func loadTargets(path string, mode int) ([]*target, []Skipped, error) {
 			skipped = append(skipped, Skipped{Hash: clip(line), Reason: err.Error()})
 			continue
 		}
-		targets = append(targets, &target{t: t})
+		targets = append(targets, &target{t: t, note: gpuNote(t)})
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", i18n.T("hashac.err.read_input"), err)
@@ -296,6 +344,14 @@ func (s *session) planGPU(targets []*target) *gpuPlan {
 			cpuT = append(cpuT, t)
 		}
 	}
+	// 逐个说明留在 CPU 的原因（去重），免得用户只看到"不支持 GPU"却不知为何
+	notes := map[string]bool{}
+	for _, t := range cpuT {
+		if t.note != "" && !notes[t.note] {
+			notes[t.note] = true
+			s.notice(NoticeInfo, t.note)
+		}
+	}
 	if len(gpuT) == 0 {
 		s.notice(NoticeWarn, i18n.T("hashac.gpu.unsupported"))
 		return all
@@ -318,6 +374,16 @@ func (s *session) planGPU(targets []*target) *gpuPlan {
 	if len(cpuT) > 0 {
 		s.notice(NoticeInfo, i18n.Tf("hashac.gpu.partial", len(gpuT), len(cpuT)))
 	}
+
+	// 唤醒显卡：空载时 GPU 停在低功耗档（P8，核心频率几百 MHz），驱动只对
+	// 持续负载提频。先用第一个 GPU 目标打满一小段时间把频率拉起来，
+	// 否则整场爆破都跑在低档上（表现为掉速、远低于 hashcat）。
+	s.notice(NoticeInfo, i18n.Tf("hashac.gpu.warmup", cuda.WarmUpDuration))
+	if err := cuda.WarmUpHash(*gpuT[0].t.GPU, dev.Index, cuda.WarmUpDuration); err != nil {
+		s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
+		return all
+	}
+
 	return &gpuPlan{
 		enabled: true,
 		device:  dev.Index,
@@ -407,7 +473,9 @@ func (s *session) runCPU(ctx context.Context, src mask.Source, threads int) {
 // runMixed GPU + CPU 混合管线：读者按批读字典/枚举掩码，分发协程把同一批候选
 // 同时投递给 GPU 消费者（单协程）与 CPU 工作协程（多协程）。
 func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, threads int) {
-	const batchSize = 2048
+	// 批大小：配合多槽位异步流水线，让 GPU 持续工作。
+	// 8 个槽位 × 131072 = 1M 候选同时在飞，GPU 不会空闲。
+	const batchSize = 131072
 
 	raw := make(chan *wordBatch, 4)
 	var gpuCh, cpuCh chan *wordBatch
@@ -418,7 +486,12 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 		cpuCh = make(chan *wordBatch, 8)
 	}
 
-	// 读者：按批读入候选
+	// 读者：按批读入候选。
+	//
+	// 掩码枚举是单协程的，便宜哈希（裸 MD5 等）的 GPU 内核只要几十微秒，
+	// 单协程生成候选（~52M/s）喂不满显卡（~300M/s）。有 GPU 目标且来源是
+	// 掩码枚举时，按 CPU 核数并行枚举：每个协程独立分段、独立攒批，发送到
+	// 同一个 raw 通道（顺序不保证，但爆破只要不重不漏）。
 	go func() {
 		defer close(raw)
 		batch := make([]string, 0, batchSize)
@@ -435,6 +508,47 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 				return true
 			}
 		}
+
+		// 并行枚举：每个协程自己的攒批，互不影响
+		if pe, ok := src.(interface {
+			EachParallel(int, func(string))
+		}); ok && len(plan.gpu) > 0 {
+			n := runtime.GOMAXPROCS(0)
+			if n > 8 {
+				n = 8
+			}
+			var wg sync.WaitGroup
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					local := make([]string, 0, batchSize)
+					localFlush := func() bool {
+						if len(local) == 0 {
+							return true
+						}
+						send := local
+						local = make([]string, 0, batchSize)
+						select {
+						case <-ctx.Done():
+							return false
+						case raw <- &wordBatch{pw: send}:
+							return true
+						}
+					}
+					pe.EachParallel(n, func(pw string) {
+						local = append(local, pw)
+						if len(local) >= batchSize {
+							localFlush()
+						}
+					})
+					localFlush()
+				}()
+			}
+			wg.Wait()
+			return
+		}
+
 		src.Each(func(pw string) bool {
 			batch = append(batch, pw)
 			if len(batch) >= batchSize {
@@ -501,27 +615,146 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 	wg.Wait()
 }
 
-// gpuLoop GPU 消费者：每批候选整体下发给 GPU，超长候选与 GPU 故障时走 CPU 兜底。
+// gpuLoop GPU 消费者：每批候选下发给 GPU，超出该目标长度上限的候选与 GPU 故障时走 CPU 兜底。
+//
+// 单 GPU 目标走多槽位异步流水线：多个批次同时在飞，GPU 持续工作不空闲。
+// 只有当流水线满或通道关闭时才收结果，最大化 GPU 利用率。
 func (s *session) gpuLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPlan) {
 	gpuOn := true
 	fallbackNoticed := false
 
+	// 多槽位流水线：多个批次同时在飞，GPU 持续工作。
+	// 环大小取自 native（cuda.PipelineSlots）：更大就会在 begin 里阻塞等最老的
+	// 槽位（该批在飞但主机停工），更小则喂不满 GPU。
+	numSlots := cuda.PipelineSlots()
+	if numSlots < 1 {
+		numSlots = 1
+	}
+	type slotState struct {
+		handle int
+		target *target
+		sent   []string
+	}
+	slots := make([]*slotState, numSlots)
+	slotIdx := 0
+
+	// 收指定槽位的结果
+	collect := func(slot *slotState) {
+		if slot == nil {
+			return
+		}
+		idx, err := cuda.VerifyHashEnd(slot.handle, plan.device)
+		if err != nil {
+			// GPU 出错：这批候选一枚都没校验过，交给 CPU 兜底，不能丢候选
+			gpuOn = false
+			if !fallbackNoticed {
+				fallbackNoticed = true
+				s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
+			}
+			s.cpuCheck(slot.target, slot.sent)
+			return
+		}
+		if idx < 0 {
+			return
+		}
+		if slot.target.t.Check.Check(slot.sent[idx]) {
+			s.hit(slot.target, slot.sent[idx])
+		}
+	}
+
+	// 收所有在飞批次的结果（通道关闭 / 提前收工时调用，避免槽位一直挂在 native 侧）
+	collectAll := func() {
+		for _, slot := range slots {
+			collect(slot)
+		}
+		slots = make([]*slotState, numSlots)
+		slotIdx = 0
+	}
+
 	for b := range ch {
 		if ctx.Err() != nil {
+			collectAll()
 			return
 		}
 		b.consume(&s.checked)
 
-		// 超过 GPU 单候选上限的密码只能由 CPU 校验
-		var send, over []string
+		// 超过通用单候选上限的密码，任何算法都只能由 CPU 校验
+		var fit, over []string
 		for _, pw := range b.pw {
 			if len(pw) > cuda.MaxPasswordLen {
 				over = append(over, pw)
 			} else {
-				send = append(send, pw)
+				fit = append(fit, pw)
 			}
 		}
 
+		if !gpuOn {
+			for _, t := range plan.gpu {
+				if t.cracked.Load() {
+					continue
+				}
+				t.attempts.Add(int64(len(b.pw)))
+				for _, pw := range b.pw {
+					if t.t.Check.Check(pw) {
+						s.hit(t, pw)
+						break
+					}
+				}
+			}
+			continue
+		}
+
+		if len(plan.gpu) == 1 {
+			t := plan.gpu[0]
+			if t.cracked.Load() {
+				continue
+			}
+			t.attempts.Add(int64(len(b.pw)))
+
+			var send, unfit []string
+			for _, pw := range fit {
+				if cuda.HashPasswordFits(t.t.GPU.Algo, pw) {
+					send = append(send, pw)
+				} else {
+					unfit = append(unfit, pw)
+				}
+			}
+			cands := append(over, unfit...)
+
+			// 环满则先收最老的一批，腾出槽位再提交新批次：
+			// 反过来做的话，新批次会在 native 侧撞上「槽位全满」的兜底路径而
+			// 阻塞到最老那批算完，GPU 这段时间没有新内核可跑。
+			if slots[slotIdx] != nil {
+				collect(slots[slotIdx])
+				slots[slotIdx] = nil
+			}
+			if gpuOn && len(send) > 0 {
+				h, err := cuda.VerifyHashAsync(*t.t.GPU, send, plan.device)
+				switch {
+				case err != nil:
+					gpuOn = false
+					if !fallbackNoticed {
+						fallbackNoticed = true
+						s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
+					}
+					s.cpuCheck(t, b.pw)
+				default:
+					slots[slotIdx] = &slotState{handle: h, target: t, sent: send}
+					t.lastSend = send
+					slotIdx = (slotIdx + 1) % numSlots
+					// GPU 在飞，CPU 只校验进不了 GPU 的候选
+					s.cpuCheck(t, cands)
+					continue
+				}
+			} else if !gpuOn {
+				s.cpuCheck(t, b.pw)
+			} else {
+				s.cpuCheck(t, cands)
+			}
+			continue
+		}
+
+		// 多 GPU 目标：同步路径（每个目标一批，结果一致）
 		for _, t := range plan.gpu {
 			if ctx.Err() != nil {
 				return
@@ -531,38 +764,40 @@ func (s *session) gpuLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPl
 			}
 			t.attempts.Add(int64(len(b.pw)))
 
-			// CPU 兜底时校验的候选集：GPU 关闭 → 整批；否则 → 仅超长候选
-			cands := over
+			var send, unfit []string
+			for _, pw := range fit {
+				if cuda.HashPasswordFits(t.t.GPU.Algo, pw) {
+					send = append(send, pw)
+				} else {
+					unfit = append(unfit, pw)
+				}
+			}
+			cands := append(over, unfit...)
 
 			if gpuOn && len(send) > 0 {
 				hit, err := s.confirmGPU(t, send, plan.device)
 				switch {
 				case err != nil:
-					// 本批及后续批次改由 CPU 处理，只提示一次
 					gpuOn = false
-					cands = b.pw
 					if !fallbackNoticed {
 						fallbackNoticed = true
 						s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
 					}
+					s.cpuCheck(t, b.pw)
 				case hit:
 					continue
-				default:
-					// GPU 的弱校验已排除本批的 send：头部校验是完整校验的
-					// 必要条件，故无需再用 CPU 重复校验这些候选。
 				}
 			} else if !gpuOn {
-				cands = b.pw
+				s.cpuCheck(t, b.pw)
 			}
-
-			for _, pw := range cands {
-				if t.t.Check.Check(pw) {
-					s.hit(t, pw)
-					break
-				}
+			if !t.cracked.Load() {
+				s.cpuCheck(t, cands)
 			}
 		}
 	}
+
+	// 通道关闭，收所有在飞批次的结果
+	collectAll()
 }
 
 // confirmGPU 向 GPU 索取命中候选并用 CPU 复核，确认后登记结果。

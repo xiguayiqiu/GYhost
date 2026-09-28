@@ -22,6 +22,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <pthread.h>
 
 /* ------------------------------------------------------------------ *
  * 1. 编译期工具                                                       *
@@ -434,6 +435,32 @@ GY_HOSTDEV void gy_sha512_update(GySHA512Ctx *c, const void *data, int n) {
         }
     }
 }
+
+/*
+ * gy_sha256_fixed — 定长输入的单次 SHA-256 计算（消除 init/update/final 冗余）。
+ * 对于迭代 KDF（PBKDF2-SHA256 等），每轮输入长度固定，
+ * 可以合并 init/update/final 为单个函数，避免重复初始化上下文。
+ * 输入长度必须 <= 55 字节（单块 SHA-256）。
+ */
+GY_HOSTDEV void gy_sha256_fixed(const uint8_t *data, int n, uint8_t out[32]) {
+    uint32_t state[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                         0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+    uint8_t buf[64];
+    const uint64_t bits = (uint64_t)n << 3;
+    int i;
+    for (i = 0; i < n; i++) buf[i] = data[i];
+    buf[n] = 0x80;
+    for (i = n + 1; i < 56; i++) buf[i] = 0;
+    for (i = 0; i < 8; i++) buf[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
+    gy_sha256_transform(state, buf);
+    for (i = 0; i < 8; i++) {
+        out[i * 4 + 0] = (uint8_t)(state[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(state[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(state[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)(state[i]);
+    }
+}
+
 
 /* SHA-384 与 SHA-512 的区别只有初始向量与输出长度，共用同一套压缩函数 */
 GY_HOSTDEV void gy_sha384_init(GySHA512Ctx *c) {
@@ -864,6 +891,31 @@ GY_HOSTDEV void gy_sha1_final(GySHA1Ctx *c, uint8_t out[20]) {
     }
 }
 
+/*
+ * gy_sha1_fixed — 定长输入的单次 SHA-1 计算（消除 init/update/final 冗余）。
+ * 对于迭代 KDF（Office、PBKDF2 等），每轮输入长度固定（如 24 字节），
+ * 可以合并 init/update/final 为单个函数，避免重复初始化上下文。
+ * 输入长度必须 <= 55 字节（单块 SHA-1）。
+ */
+GY_HOSTDEV void gy_sha1_fixed(const uint8_t *data, int n, uint8_t out[20]) {
+    uint32_t state[5] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u, 0xc3d2e1f0u};
+    uint8_t buf[64];
+    const uint64_t bits = (uint64_t)n << 3;
+    int i;
+    for (i = 0; i < n; i++) buf[i] = data[i];
+    buf[n] = 0x80;
+    for (i = n + 1; i < 56; i++) buf[i] = 0;
+    for (i = 0; i < 8; i++) buf[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
+    gy_sha1_transform(state, buf);
+    for (i = 0; i < 5; i++) {
+        out[i * 4 + 0] = (uint8_t)(state[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(state[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(state[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)(state[i]);
+    }
+}
+
+
 /* 定长比较：返回 1 表示完全相同。 */
 GY_HOSTDEV int gy_memeq(const uint8_t *a, const uint8_t *b, int n) {
     uint8_t diff = 0;
@@ -1033,7 +1085,11 @@ GY_HOSTDEV void gy_hmac_sha256_pads(const uint8_t *key, int keylen,
 
 /* ============================ PBKDF2 ============================ */
 
-/* PBKDF2-HMAC-SHA1（RFC 2898）。 */
+/*
+ * gy_pbkdf2_sha1 — PBKDF2-HMAC-SHA1（RFC 2898），使用定长 SHA-1 优化。
+ * 原实现每轮迭代都重新初始化 SHA-1 上下文，这里使用 gy_sha1_fixed
+ * 消除 init/update/final 的冗余，大幅提升迭代 KDF 的性能。
+ */
 GY_HOSTDEV void gy_pbkdf2_sha1(const uint8_t *pw, int pwlen,
                                const uint8_t *salt, int saltlen,
                                int iter, uint8_t *out, int outlen) {
@@ -1086,7 +1142,11 @@ GY_HOSTDEV void gy_pbkdf2_sha1(const uint8_t *pw, int pwlen,
     }
 }
 
-/* PBKDF2-HMAC-SHA256（块长 32 字节）。 */
+/*
+ * gy_pbkdf2_sha256 — PBKDF2-HMAC-SHA256（块长 32 字节），使用定长 SHA-256 优化。
+ * 原实现每轮迭代都重新初始化 SHA-256 上下文，这里使用 gy_sha256_fixed
+ * 消除 init/update/final 的冗余，大幅提升迭代 KDF 的性能。
+ */
 GY_HOSTDEV void gy_pbkdf2_sha256(const uint8_t *pw, int pwlen,
                                  const uint8_t *salt, int saltlen,
                                  int iter, uint8_t *out, int outlen) {
@@ -1443,26 +1503,37 @@ GY_HOSTDEV void gy_aes_decrypt_block(const GyAESKey *k, const uint8_t in[16], ui
     for (int i = 0; i < 16; i++) {
         s[i] = in[i] ^ k->rk[k->nr][i];
     }
+    /*
+     * 逆密码顺序必须与 gy_aes_decrypt_key 匹配：
+     * 轮密钥已在中层轮做 InvMixColumns 预乘（等价逆密码 FIPS-197 5.3.5），
+     * 因此每轮是 InvSubBytes → InvShiftRows → InvMixColumns → AddRoundKey。
+     * 若把 InvMixColumns 放在 AddRoundKey 之后（直接逆密码 5.3 的顺序），
+     * 预乘过的轮密钥会被多乘一次，解密结果全错（曾导致 7z / RAR3-hp /
+     * Office 的 --gpu 路径静默漏解）。
+     */
     for (int r = k->nr - 1; r >= 1; r--) {
+        for (int i = 0; i < 16; i++) {
+            s[i] = gy_aes_inv_sbox[s[i]];
+        }
         /* InvShiftRows（行 1/2/3 分别右移 1/2/3） */
         t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t;
         t = s[2];  s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
         t = s[3];  s[3] = s[7];  s[7] = s[11]; s[11] = s[15]; s[15] = t;
-        for (int i = 0; i < 16; i++) {
-            s[i] = gy_aes_inv_sbox[s[i]];
+        for (int c = 0; c < 4; c++) {
+            gy_aes_inv_mixcol(s + 4 * c);
         }
         for (int i = 0; i < 16; i++) {
             s[i] ^= k->rk[r][i];
         }
-        for (int c = 0; c < 4; c++) {
-            gy_aes_inv_mixcol(s + 4 * c);
-        }
+    }
+    for (int i = 0; i < 16; i++) {
+        s[i] = gy_aes_inv_sbox[s[i]];
     }
     t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t;
     t = s[2];  s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
     t = s[3];  s[3] = s[7];  s[7] = s[11]; s[11] = s[15]; s[15] = t;
     for (int i = 0; i < 16; i++) {
-        out[i] = gy_aes_inv_sbox[s[i]] ^ k->rk[0][i];
+        out[i] = s[i] ^ k->rk[0][i];
     }
 }
 
@@ -1571,7 +1642,8 @@ GY_HOSTDEV int gy_7z_check(const uint8_t *pw16, int pw16len,
     if (ivlen != 16 || checklen != 4) {
         return 0;
     }
-    if (datalen <= 0 || datalen > GYHOST_HASH_MAX_DATA || (datalen & 15) != 0) {
+    /* 解密按 16 字节分块流式进行，没有大栈缓冲，因此上限与 WinZip AES 一致 */
+    if (datalen <= 0 || datalen > GYHOST_HASH_MAX_CIPHER_DATA || (datalen & 15) != 0) {
         return 0;
     }
     if (unpack <= 0 || unpack > datalen) {
@@ -1656,7 +1728,7 @@ GY_HOSTDEV int gy_zipcrypto_check(const uint8_t *pw, int pwlen,
                                   const uint8_t *data, int datalen,
                                   const uint8_t *check, int checklen,
                                   int b) {
-    if (checklen != 4 || datalen <= 12) {
+    if (checklen != 4 || datalen < 12) {
         return 0;
     }
     if (b != 1 && b != 2) {
@@ -2138,6 +2210,244 @@ GY_HOSTDEV int gy_pdf_v5_check(const uint8_t *pw, int pwlen, const uint8_t *u, c
 }
 
 
+
+/* ============================ Office 文档口令（hashcat -m 9400/9500/9600） ============================ */
+
+/*
+ * 加密 Office 文档的口令按 UTF-16LE 编码参与 KDF（与 7z / RAR3-hp 相同），
+ * 最多 127 个码元 = 254 字节（GY_MAX_PW 为 255，留 1 字节余量保证恒为偶数）；
+ * 更长的候选由 Go 侧 HashPasswordFits 分流到 CPU。
+ */
+#define GY_OFFICE_MAX_PW16 254
+
+/* [MS-OFFCRYPTO] 1.3.6 的迭代轮数上限（与 cuda.go 的 MaxHashIter 一致）。 */
+#define GY_OFFICE_MAX_ITER (1 << 24)
+
+/* SHA-1 策略：与 GySHA256Policy/GySHA512Policy 同形，供 Office 的 KDF 模板使用。 */
+struct GySHA1Policy {
+    typedef GySHA1Ctx Ctx;
+    enum { HLEN = 20 };
+    static GY_HOSTDEV void init(Ctx &c) { gy_sha1_init(&c); }
+    static GY_HOSTDEV void update(Ctx &c, const void *p, int n) { gy_sha1_update(&c, p, n); }
+    static GY_HOSTDEV void final(Ctx &c, uint8_t *out) { gy_sha1_final(&c, out); }
+};
+
+/*
+ * gy_office_kdf — [MS-OFFCRYPTO] 1.3.6 的口令哈希迭代：
+ *
+ *   H(0) = SHAx(盐 ‖ 口令)，H(n) = SHAx(LE32(n-1) ‖ H(n-1))，共 spin 轮。
+ *
+ * 结果写入 out（SHA-1 为 20 字节，SHA-512 为 64 字节）。
+ * 使用定长 SHA-1 优化消除 init/update/final 冗余。
+ */
+template <class P>
+GY_HOSTDEV void gy_office_kdf(const uint8_t *salt, int saltlen,
+                              const uint8_t *pw16, int pw16len,
+                              int spin, uint8_t *out) {
+    uint8_t prev[P::HLEN], buf[4 + P::HLEN];
+    typename P::Ctx c;
+
+    P::init(c);
+    P::update(c, salt, saltlen);
+    P::update(c, pw16, pw16len);
+    P::final(c, prev);
+
+    for (int i = 0; i < spin; i++) {
+        buf[0] = (uint8_t)i;
+        buf[1] = (uint8_t)(i >> 8);
+        buf[2] = (uint8_t)(i >> 16);
+        buf[3] = (uint8_t)(i >> 24);
+        gy_copy(buf + 4, prev, P::HLEN);
+        /* 使用定长 SHA-1 消除 init/update/final 冗余 */
+        if (P::HLEN == 20) {
+            gy_sha1_fixed(buf, 24, prev);
+        } else {
+            P::init(c);
+            P::update(c, buf, 4 + P::HLEN);
+            P::final(c, prev);
+        }
+    }
+    gy_copy(out, prev, P::HLEN);
+}
+
+/*
+ * gy_office_block_key — [MS-OFFCRYPTO] 2.3.4.4：block key 拼在 KDF 结果之后再摘要一次，
+ * 取前 keylen 字节；摘要短于密钥时（SHA-1 配 192/256 位密钥）按规范补 0x36。
+ */
+template <class P>
+GY_HOSTDEV void gy_office_block_key(const uint8_t *dg, const uint8_t *blockkey,
+                                    int keylen, uint8_t *out) {
+    uint8_t buf[P::HLEN + 8], k[P::HLEN];
+    typename P::Ctx c;
+
+    gy_copy(buf, dg, P::HLEN);
+    gy_copy(buf + P::HLEN, blockkey, 8);
+    P::init(c);
+    P::update(c, buf, P::HLEN + 8);
+    P::final(c, k);
+
+    const int n = keylen < P::HLEN ? keylen : P::HLEN;
+    gy_copy(out, k, n);
+    for (int i = n; i < keylen; i++) {
+        out[i] = 0x36;
+    }
+}
+
+/* 2.3.4.7：X = SHA1(pad 填充 ‖ H)，H 的每个字节与 pad 异或，其余字节补 pad。 */
+GY_HOSTDEV void gy_office_pad_sha1(const uint8_t dg[20], uint8_t pad, uint8_t out[20]) {
+    uint8_t blk[64];
+    GySHA1Ctx c;
+
+    for (int i = 0; i < 64; i++) {
+        blk[i] = pad;
+    }
+    for (int i = 0; i < 20; i++) {
+        blk[i] = (uint8_t)(pad ^ dg[i]);
+    }
+    gy_sha1_init(&c);
+    gy_sha1_update(&c, blk, 64);
+    gy_sha1_final(&c, out);
+}
+
+/* AES-CBC 解密整段密文（IV = 盐），密文长度必须是 16 的倍数。 */
+GY_HOSTDEV void gy_office_cbc(const uint8_t *key, int keybits, const uint8_t iv[16],
+                              const uint8_t *in, int len, uint8_t *out) {
+    GyAESKey ak;
+    uint8_t prev[16], dec[16];
+
+    gy_aes_decrypt_key(&ak, key, keybits);
+    gy_copy(prev, iv, 16);
+    for (int off = 0; off < len; off += 16) {
+        gy_aes_decrypt_block(&ak, in + off, dec);
+        for (int j = 0; j < 16; j++) {
+            out[off + j] = (uint8_t)(dec[j] ^ prev[j]);
+        }
+        gy_copy(prev, in + off, 16);
+    }
+}
+
+/*
+ * gy_office_check — 加密 Office 文档的口令校验（hashcat -m 9400/9500/9600）。
+ *
+ * 字段布局与 internal/cuda 的 HashOffice 注释一致：
+ *   Salt = 16 字节盐（2010/2013 兼作 CBC 的 IV）
+ *   Data = LE32(年份) ‖ LE32(verifierHashSize，仅 2007 用) ‖ 加密校验值(16 字节)
+ *   Check = 加密校验哈希（2007 至少 16 字节，2010/2013 至少 32 字节）
+ *   Iter = KDF 轮数（2007 恒为 50000）
+ *   KeyLen = AES 密钥字节数（16/24/32）
+ *
+ * pw16 是按 UTF-16LE 编码的候选口令。返回 1 命中 / 0 未命中。
+ */
+GY_HOSTDEV int gy_office_check(const uint8_t *pw16, int pw16len,
+                               const uint8_t *salt, int saltlen,
+                               const uint8_t *data, int datalen,
+                               const uint8_t *check, int checklen,
+                               int iter, int keylen) {
+    if (saltlen != 16 || datalen != 24 || iter < 0 || iter > GY_OFFICE_MAX_ITER) {
+        return 0;
+    }
+    if (keylen != 16 && keylen != 24 && keylen != 32) {
+        return 0;
+    }
+    if (pw16len < 0 || pw16len > GY_OFFICE_MAX_PW16) {
+        return 0;
+    }
+    const int year = (int)((uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+                           ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24));
+    const int hashsize = (int)((uint32_t)data[4] | ((uint32_t)data[5] << 8) |
+                               ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24));
+    const uint8_t *verifier = data + 8;
+
+    if (year == 2007) {
+        /*
+         * 标准加密（-m 9400）：SHA-1 KDF → 收尾块 SHA1(H ‖ LE32(0)) →
+         * DeriveKey(0x36/0x5C 填充) → AES-ECB 解出校验值，
+         * 比对 SHA-1(校验值) 的前 16 字节。
+         *
+         * 优化：复用缓冲区，减少寄存器使用。
+         */
+        uint8_t dg[24], key[40], fin[20], plain[16], dec[16];
+        GyAESKey ak;
+        GySHA1Ctx c;
+
+        if (checklen < 16 || hashsize <= 0 || hashsize > 64) {
+            return 0;
+        }
+        gy_office_kdf<GySHA1Policy>(salt, saltlen, pw16, pw16len, iter, dg);
+
+        /* 收尾块 SHA1(H ‖ LE32(0))：dg 复用成 H ‖ 0000 的暂存区 */
+        dg[20] = 0;
+        dg[21] = 0;
+        dg[22] = 0;
+        dg[23] = 0;
+        gy_sha1_init(&c);
+        gy_sha1_update(&c, dg, 24);
+        gy_sha1_final(&c, fin);
+
+        /*
+         * 2.3.4.7 的 DeriveKey：两段都从同一个 fin 出发。
+         * 注意第二段不能再拿 key 自身当摘要——key 此时已经是 0x36 段的结果，
+         * 那样 AES-256（verifierHashSize < 密钥长度）会派生出完全错误的密钥。
+         */
+        gy_office_pad_sha1(fin, 0x36, key);
+        if (hashsize < keylen) { /* verifierHashSize 不足时才需要第二段 0x5C */
+            gy_office_pad_sha1(fin, 0x5c, key + 20);
+        }
+        gy_aes_decrypt_key(&ak, key, keylen * 8);
+        gy_aes_decrypt_block(&ak, verifier, plain);
+        gy_aes_decrypt_block(&ak, check, dec);
+
+        gy_sha1_init(&c);
+        gy_sha1_update(&c, plain, 16);
+        gy_sha1_final(&c, dg); /* 复用 dg 作为 sum */
+        return gy_memeq(dg, dec, 16);
+    }
+
+    if (year == 2010 || year == 2013) {
+        /*
+         * agile 加密（-m 9500/9600）：SHA-1（2010）/ SHA-512（2013）KDF，
+         * 两个 block key 分别派生校验值密钥与校验哈希密钥，
+         * AES-CBC（IV = 盐）解出 16 字节校验值与 32 字节校验哈希，
+         * 比对摘要的前 20 字节（officeCompareLen）。
+         *
+         * 优化：复用缓冲区，减少寄存器使用。
+         */
+        const uint8_t blkInput[8] = {0xfe, 0xa7, 0xd2, 0x76, 0x3b, 0x4b, 0x9e, 0x79};
+        const uint8_t blkValue[8] = {0xd7, 0xaa, 0x0f, 0x6d, 0x30, 0x61, 0x34, 0x4e};
+        uint8_t dg[64], k1[32], k2[32], plain[16], value[32];
+
+        if (checklen < 32) {
+            return 0;
+        }
+        if (year == 2010) {
+            gy_office_kdf<GySHA1Policy>(salt, saltlen, pw16, pw16len, iter, dg);
+            gy_office_block_key<GySHA1Policy>(dg, blkInput, keylen, k1);
+            gy_office_block_key<GySHA1Policy>(dg, blkValue, keylen, k2);
+        } else {
+            gy_office_kdf<GySHA512Policy>(salt, saltlen, pw16, pw16len, iter, dg);
+            gy_office_block_key<GySHA512Policy>(dg, blkInput, keylen, k1);
+            gy_office_block_key<GySHA512Policy>(dg, blkValue, keylen, k2);
+        }
+        gy_office_cbc(k1, keylen * 8, salt, verifier, 16, plain);
+        gy_office_cbc(k2, keylen * 8, salt, check, 32, value);
+
+        /* 复用 dg 作为 sum 缓冲区 */
+        if (year == 2010) {
+            GySHA1Ctx c;
+            gy_sha1_init(&c);
+            gy_sha1_update(&c, plain, 16);
+            gy_sha1_final(&c, dg);
+        } else {
+            GySHA512Ctx c;
+            gy_sha512_init(&c);
+            gy_sha512_update(&c, plain, 16);
+            gy_sha512_final(&c, dg);
+        }
+        return gy_memeq(dg, value, 20);
+    }
+    return 0;
+}
+
 /*
  * gy_generic_hash_check — 主机与 GPU 共用的通用哈希校验。
  *
@@ -2251,6 +2561,10 @@ GY_HOSTDEV int gy_generic_hash_check(int algo,
         return gy_wpa2_eapol_check((const uint8_t *)pw, pwlen, sp, saltlen,
                                    xp, extralen, cp, checklen, iter);
     }
+    if (algo == GYHOST_HASH_OFFICE) {
+        return gy_office_check((const uint8_t *)pw, pwlen, sp, saltlen,
+                               xp, extralen, cp, checklen, iter, keylen);
+    }
     if (algo == GYHOST_HASH_PDF) {
         /*
          * PDF 口令校验（hashcat -m 10400/10500/10600/10700）。
@@ -2298,6 +2612,7 @@ int gyhost_hash_supported(int algo) {
         case GYHOST_HASH_ZIPCRYPTO:
         case GYHOST_HASH_WPA2_EAPOL:
         case GYHOST_HASH_PDF:
+        case GYHOST_HASH_OFFICE:
             return 1;
         default:
             return 0;
@@ -2307,6 +2622,27 @@ int gyhost_hash_supported(int algo) {
 /* ------------------------------------------------------------------ *
  * 5. GPU 内核                                                         *
  * ------------------------------------------------------------------ */
+
+/*
+ * gy_extra_limit — Data 字段的长度上限（按算法区分）。
+ *
+ * 多数算法只需要一小段附加数据（HMAC 输入、RAR3 的 16 字节密文头等），
+ * 但有三类必须整段下发：
+ *   - WinZip AES / 7z：认证码与 CRC 覆盖整段密文，1 MiB；
+ *   - WPA2-EAPOL：MIC 覆盖整个 802.1X 帧，64 KiB。
+ * 用统一的 384 字节上限会把这些算法的真实条目全部挡在 GPU 之外（--gpu 静默回退 CPU）。
+ */
+static int gy_extra_limit(int algo) {
+    switch (algo) {
+    case GYHOST_HASH_ZIP_AES:
+    case GYHOST_HASH_7Z:
+        return GYHOST_HASH_MAX_CIPHER_DATA;
+    case GYHOST_HASH_WPA2_EAPOL:
+        return GYHOST_HASH_MAX_EAPOL_DATA;
+    default:
+        return GYHOST_HASH_MAX_DATA;
+    }
+}
 
 /* 一个线程 = 一个候选密码；命中则用 atomicMin 记录最小下标 */
 __global__ void gy_verify_kernel(int algo, const char *pw_data, const int *pw_off,
@@ -2594,7 +2930,7 @@ int gyhost_cuda_check_hash(int algo, const char *pw, int pw_len,
         return GYHOST_CUDA_ERR_PARAM;
     }
     if (salt_len < 0 || salt_len > GYHOST_HASH_MAX_SALT ||
-        extra_len < 0 || extra_len > GYHOST_HASH_MAX_DATA ||
+        extra_len < 0 || extra_len > gy_extra_limit(algo) ||
         check_len < 0 || check_len > GYHOST_HASH_MAX_CHECK) {
         return GYHOST_CUDA_ERR_PARAM;
     }
@@ -2632,7 +2968,7 @@ int gyhost_cuda_verify_hash(int algo, const char *pw_data, int pw_total,
     }
     if (pw_total < 0 ||
         salt_len < 0 || salt_len > GYHOST_HASH_MAX_SALT ||
-        extra_len < 0 || extra_len > GYHOST_HASH_MAX_DATA ||
+        extra_len < 0 || extra_len > gy_extra_limit(algo) ||
         check_len <= 0 || check_len > GYHOST_HASH_MAX_CHECK ||
         iter < 0 || key_len < 0) {
         return GYHOST_CUDA_ERR_PARAM;
@@ -2752,4 +3088,444 @@ int gyhost_cuda_verify_hash(int algo, const char *pw_data, int pw_total,
 
     *match = (best < count) ? best : -1;
     return GYHOST_CUDA_OK;
+}
+
+/* ------------------------------------------------------------------ *
+ * 5b. 异步流水线（begin/end）                                          *
+ * ------------------------------------------------------------------ */
+
+#define GY_CACHE_SLOTS 4
+static pthread_mutex_t gy_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ------------------------------------------------------------------ *
+ * 5b. 异步流水线（begin/end）                                          *
+ * ------------------------------------------------------------------ */
+
+/*
+ * 异步流水线接口：begin 只上传候选并发射内核，立即返回；
+ * end 等事件并读结果。调用方在两次调用之间准备下一批候选，
+ * GPU 就能和主机并行工作。
+ */
+
+/*
+ * 异步流水线接口：begin 只上传候选并发射内核，立即返回；
+ * end 等事件并读结果。调用方在两次调用之间准备下一批候选，
+ * GPU 就能和主机并行工作。
+ *
+ * 槽位数必须不小于调用方同时在飞的批次数（Go 侧用 cuda.PipelineSlots() 对齐），
+ * 否则第 3 批就会阻塞在 begin 里等最老的槽位腾出来：主机在阻塞期间既不能
+ * 准备下一批、GPU 也没有新内核可跑，利用率直接掉一半（--gpu 跑不满的主因）。
+ */
+#define GY_PIPE_SLOTS 8
+
+/*
+ * 一个槽位 = 一条流 + 一组常驻显存 + 一块页锁定（pinned）主机暂存区。
+ *
+ * 为什么要有 pinned 暂存区：cudaMemcpyAsync 对可分页内存会先把数据同步
+ * 拷进驱动内部的 pinned 缓冲区再返回，主机在这段时间是阻塞的；只有源是
+ * pinned 内存时才是真正的异步 DMA。每批候选都要上传，改用 pinned 之后
+ * 主机提交完就能去准备下一批，GPU 不用等主机。
+ *
+ * 常驻参数：crypt 目标（$1$/$5$/$6$）把 crypt 密文放在 check 槽里
+ * （gy_verify_kernel 的参数名是 key），const_is_crypt 参与比较，
+ * 因此同一槽位在两种内核之间切换时一定会重新上传。
+ */
+typedef struct {
+    size_t pw_cap, off_cap, len_cap, match_cap;
+    char *d_pw;
+    int *d_off, *d_len, *d_match;
+
+    size_t h_pw_cap, h_off_cap, h_len_cap;
+    char *h_pw;
+    int *h_off, *h_len;
+
+    size_t salt_cap, extra_cap, check_cap, iv_cap;
+    char *d_salt, *d_extra, *d_check, *d_iv;
+
+    size_t h_salt_cap, h_extra_cap, h_check_cap, h_iv_cap;
+    int const_ready, const_algo, const_iter, const_keylen, const_is_crypt;
+    size_t const_salt_len, const_extra_len, const_check_len, const_iv_len;
+    char *h_salt, *h_extra, *h_check, *h_iv;
+
+    cudaStream_t stream;
+    cudaEvent_t ev;
+    int busy;
+    int count;
+
+    /*
+     * 代际与「被抢占批」的结果。
+     *
+     * handle = (gen << 8) | sel：槽位被后来的批次抢占（全部槽位都在飞时的
+     * 兜底路径）时，先把它已算完的结果存进 pending_*，这样它原来的 handle
+     * 之后仍能取到正确结果，而不是把新批次的命中下标错记到旧批次上。
+     */
+    int gen;
+    int has_pending;
+    int pending_gen;
+    int pending_match;
+} gy_pipe_slot;
+
+typedef struct {
+    gy_pipe_slot slot[GY_PIPE_SLOTS];
+} gy_pipe_cache;
+
+static gy_pipe_cache gy_pipes[GY_CACHE_SLOTS];
+
+/* 显存缓冲：容量不足时翻倍重申请（复用已有容量，避免每批都 cudaMalloc）。 */
+static char *gy_pipe_reserve(char **buf, size_t *cap, size_t need) {
+    if (need == 0) need = 1;
+    if (*buf != NULL && *cap >= need) return *buf;
+    size_t want = *cap ? *cap : 1024;
+    while (want < need) want *= 2;
+    if (*buf != NULL) cudaFree(*buf);
+    if (cudaMalloc(buf, want) != cudaSuccess) {
+        *buf = NULL;
+        *cap = 0;
+        return NULL;
+    }
+    *cap = want;
+    return *buf;
+}
+
+/* 页锁定主机暂存区：cudaMemcpyAsync 真正异步的前提。 */
+static char *gy_pipe_reserve_host(char **buf, size_t *cap, size_t need) {
+    if (need == 0) need = 1;
+    if (*buf != NULL && *cap >= need) return *buf;
+    size_t want = *cap ? *cap : 4096;
+    while (want < need) want *= 2;
+    char *nb = NULL;
+    if (cudaMallocHost((void **) &nb, want) != cudaSuccess) {
+        cudaGetLastError();
+        return NULL;
+    }
+    if (*buf != NULL) cudaFreeHost(*buf);
+    *buf = nb;
+    *cap = want;
+    return nb;
+}
+
+static int gy_pipe_const_same(const gy_pipe_slot *s, int is_crypt, int algo, int iter, int key_len,
+                              const char *salt, size_t salt_len, const char *extra, size_t extra_len,
+                              const char *check, size_t check_len, const char *iv, size_t iv_len) {
+    if (!s->const_ready || s->const_is_crypt != is_crypt || s->const_algo != algo ||
+        s->const_iter != iter || s->const_keylen != key_len || s->const_salt_len != salt_len ||
+        s->const_extra_len != extra_len || s->const_check_len != check_len ||
+        s->const_iv_len != iv_len) {
+        return 0;
+    }
+    if (salt_len > 0 && memcmp(s->h_salt, salt, salt_len) != 0) return 0;
+    if (extra_len > 0 && memcmp(s->h_extra, extra, extra_len) != 0) return 0;
+    if (check_len > 0 && memcmp(s->h_check, check, check_len) != 0) return 0;
+    if (iv_len > 0 && memcmp(s->h_iv, iv, iv_len) != 0) return 0;
+    return 1;
+}
+
+static int gy_pipe_const_upload(gy_pipe_slot *s, int is_crypt, int algo, int iter, int key_len,
+                                const char *salt, size_t salt_len, const char *extra, size_t extra_len,
+                                const char *check, size_t check_len, const char *iv, size_t iv_len) {
+    if (salt_len > s->h_salt_cap) { s->h_salt = (char *) realloc(s->h_salt, salt_len); s->h_salt_cap = salt_len; }
+    if (extra_len > s->h_extra_cap) { s->h_extra = (char *) realloc(s->h_extra, extra_len); s->h_extra_cap = extra_len; }
+    if (check_len > s->h_check_cap) { s->h_check = (char *) realloc(s->h_check, check_len); s->h_check_cap = check_len; }
+    if (iv_len > s->h_iv_cap) { s->h_iv = (char *) realloc(s->h_iv, iv_len); s->h_iv_cap = iv_len; }
+    if ((salt_len > 0 && s->h_salt == NULL) || (extra_len > 0 && s->h_extra == NULL) ||
+        (check_len > 0 && s->h_check == NULL) || (iv_len > 0 && s->h_iv == NULL)) {
+        return GYHOST_CUDA_ERR_ALLOC;
+    }
+    if (gy_pipe_reserve(&s->d_salt, &s->salt_cap, salt_len) == NULL ||
+        gy_pipe_reserve(&s->d_extra, &s->extra_cap, extra_len) == NULL ||
+        gy_pipe_reserve(&s->d_check, &s->check_cap, check_len) == NULL ||
+        gy_pipe_reserve(&s->d_iv, &s->iv_cap, iv_len) == NULL) {
+        return GYHOST_CUDA_ERR_ALLOC;
+    }
+    if (salt_len > 0 && cudaMemcpyAsync(s->d_salt, salt, salt_len, cudaMemcpyHostToDevice, s->stream) != cudaSuccess) return GYHOST_CUDA_ERR_ALLOC;
+    if (extra_len > 0 && cudaMemcpyAsync(s->d_extra, extra, extra_len, cudaMemcpyHostToDevice, s->stream) != cudaSuccess) return GYHOST_CUDA_ERR_ALLOC;
+    if (check_len > 0 && cudaMemcpyAsync(s->d_check, check, check_len, cudaMemcpyHostToDevice, s->stream) != cudaSuccess) return GYHOST_CUDA_ERR_ALLOC;
+    if (iv_len > 0 && cudaMemcpyAsync(s->d_iv, iv, iv_len, cudaMemcpyHostToDevice, s->stream) != cudaSuccess) return GYHOST_CUDA_ERR_ALLOC;
+
+    if (salt_len > 0) memcpy(s->h_salt, salt, salt_len);
+    if (extra_len > 0) memcpy(s->h_extra, extra, extra_len);
+    if (check_len > 0) memcpy(s->h_check, check, check_len);
+    if (iv_len > 0) memcpy(s->h_iv, iv, iv_len);
+    s->const_ready = 1;
+    s->const_is_crypt = is_crypt;
+    s->const_algo = algo;
+    s->const_iter = iter;
+    s->const_keylen = key_len;
+    s->const_salt_len = salt_len;
+    s->const_extra_len = extra_len;
+    s->const_check_len = check_len;
+    s->const_iv_len = iv_len;
+    return GYHOST_CUDA_OK;
+}
+
+/*
+ * gy_pipe_submit — begin 的公共实现（crypt 与通用哈希共用槽位机制）。
+ *
+ * is_crypt=1：crypt 目标，发射 gy_verify_kernel（salt/轮数/crypt 密文）。
+ * is_crypt=0：通用哈希，发射 gy_verify_hash_kernel（字段含义见 cuda.h）。
+ */
+static int gy_pipe_submit(int algo, int is_crypt,
+                          const char *pw_data, int pw_total,
+                          const int *pw_off, const int *pw_len, int count,
+                          const char *salt, int salt_len,
+                          const char *extra, int extra_len,
+                          const char *check, int check_len,
+                          const char *iv, int iv_len,
+                          int iter, int key_len,
+                          int device, int *handle) {
+    int rc = gyhost_cuda_set_device(device);
+    if (rc != GYHOST_CUDA_OK) {
+        return rc;
+    }
+
+    cudaGetLastError();
+
+    const size_t pw_bytes = (size_t)(pw_total > 0 ? pw_total : 1);
+    const size_t off_bytes = (size_t)count * sizeof(int);
+
+    pthread_mutex_lock(&gy_cache_lock);
+    gy_pipe_cache *pc = &gy_pipes[(device >= 0 && device < GY_CACHE_SLOTS) ? device : 0];
+
+    int sel = -1;
+    for (int k = 0; k < GY_PIPE_SLOTS; k++) {
+        if (!pc->slot[k].busy) {
+            sel = k;
+            break;
+        }
+    }
+    if (sel < 0) {
+        /*
+         * 槽位全满（环大小超过 gyhost_cuda_pipeline_slots() 时才会发生）：
+         * 等最老的一批（slot 0）结束，先把它的结果存下来再复用该槽位，
+         * 保证它原来的 handle 之后仍能取到正确结果。
+         */
+        sel = 0;
+        gy_pipe_slot *victim = &pc->slot[0];
+        if (cudaEventSynchronize(victim->ev) != cudaSuccess) {
+            pthread_mutex_unlock(&gy_cache_lock);
+            return GYHOST_CUDA_ERR_KERNEL;
+        }
+        int done = 0;
+        if (cudaMemcpy(&done, victim->d_match, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            pthread_mutex_unlock(&gy_cache_lock);
+            return GYHOST_CUDA_ERR_KERNEL;
+        }
+        victim->pending_match = (done >= 0 && done < victim->count) ? done : -1;
+        victim->has_pending = 1;
+        victim->pending_gen = victim->gen;
+        victim->busy = 0;
+    }
+    gy_pipe_slot *s = &pc->slot[sel];
+    if (s->stream == NULL) {
+        if (cudaStreamCreate(&s->stream) != cudaSuccess ||
+            cudaEventCreate(&s->ev) != cudaSuccess) {
+            pthread_mutex_unlock(&gy_cache_lock);
+            return GYHOST_CUDA_ERR_ALLOC;
+        }
+    }
+    int rc_err = GYHOST_CUDA_OK;
+    if (gy_pipe_reserve(&s->d_pw, &s->pw_cap, pw_bytes) == NULL ||
+        gy_pipe_reserve((char **) &s->d_off, &s->off_cap, off_bytes) == NULL ||
+        gy_pipe_reserve((char **) &s->d_len, &s->len_cap, off_bytes) == NULL ||
+        gy_pipe_reserve((char **) &s->d_match, &s->match_cap, sizeof(int)) == NULL ||
+        gy_pipe_reserve_host(&s->h_pw, &s->h_pw_cap, pw_bytes) == NULL ||
+        gy_pipe_reserve_host((char **) &s->h_off, &s->h_off_cap, off_bytes) == NULL ||
+        gy_pipe_reserve_host((char **) &s->h_len, &s->h_len_cap, off_bytes) == NULL) {
+        rc_err = GYHOST_CUDA_ERR_ALLOC;
+    }
+    if (rc_err == GYHOST_CUDA_OK &&
+        !gy_pipe_const_same(s, is_crypt, algo, iter, key_len, salt, (size_t) salt_len, extra,
+                            (size_t) extra_len, check, (size_t) check_len, iv, (size_t) iv_len)) {
+        rc_err = gy_pipe_const_upload(s, is_crypt, algo, iter, key_len, salt, (size_t) salt_len,
+                                      extra, (size_t) extra_len, check, (size_t) check_len,
+                                      iv, (size_t) iv_len);
+    }
+    if (rc_err == GYHOST_CUDA_OK) {
+        int sentinel = count;
+        memcpy(s->h_pw, pw_data, pw_bytes);
+        memcpy(s->h_off, pw_off, off_bytes);
+        memcpy(s->h_len, pw_len, off_bytes);
+        if (cudaMemcpyAsync(s->d_match, &sentinel, sizeof(int), cudaMemcpyHostToDevice, s->stream) != cudaSuccess ||
+            cudaMemcpyAsync(s->d_pw, s->h_pw, pw_bytes, cudaMemcpyHostToDevice, s->stream) != cudaSuccess ||
+            cudaMemcpyAsync(s->d_off, s->h_off, off_bytes, cudaMemcpyHostToDevice, s->stream) != cudaSuccess ||
+            cudaMemcpyAsync(s->d_len, s->h_len, off_bytes, cudaMemcpyHostToDevice, s->stream) != cudaSuccess) {
+            rc_err = GYHOST_CUDA_ERR_ALLOC;
+        }
+    }
+    if (rc_err == GYHOST_CUDA_OK) {
+        dim3 block(GY_BLOCK);
+        dim3 grid((count + GY_BLOCK - 1) / GY_BLOCK);
+        if (is_crypt) {
+            gy_verify_kernel<<<grid, block, 0, s->stream>>>(algo, s->d_pw, s->d_off, s->d_len, count,
+                                                            s->d_salt, salt_len, iter, s->d_check,
+                                                            s->d_match);
+        } else {
+            gy_verify_hash_kernel<<<grid, block, 0, s->stream>>>(algo, s->d_pw, s->d_off, s->d_len, count,
+                                                                 s->d_salt, salt_len, s->d_extra, extra_len,
+                                                                 s->d_check, check_len, s->d_iv, iv_len,
+                                                                 iter, key_len, s->d_match);
+        }
+        if (cudaGetLastError() != cudaSuccess) {
+            rc_err = GYHOST_CUDA_ERR_KERNEL;
+        } else {
+            cudaEventRecord(s->ev, s->stream);
+            s->busy = 1;
+            s->count = count;
+            s->gen++;
+            *handle = (s->gen << 8) | sel;
+        }
+    }
+
+    pthread_mutex_unlock(&gy_cache_lock);
+    if (rc_err != GYHOST_CUDA_OK) {
+        cudaGetLastError();
+        return rc_err;
+    }
+    return GYHOST_CUDA_OK;
+}
+
+/* 流水线槽位数：Go 侧据此决定同时在飞的批次数（cuda.PipelineSlots）。 */
+int gyhost_cuda_pipeline_slots(void) { return GY_PIPE_SLOTS; }
+
+int gyhost_cuda_verify_hash_begin(int algo, const char *pw_data, int pw_total,
+                                  const int *pw_off, const int *pw_len, int count,
+                                  const char *salt, int salt_len,
+                                  const char *extra, int extra_len,
+                                  const char *check, int check_len,
+                                  const char *iv, int iv_len,
+                                  int iter, int key_len,
+                                  int device, int *handle) {
+    if (pw_data == NULL || pw_off == NULL || pw_len == NULL || salt == NULL ||
+        extra == NULL || check == NULL || handle == NULL) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (count <= 0 || count > (1 << 20)) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (pw_total < 0 ||
+        salt_len < 0 || salt_len > GYHOST_HASH_MAX_SALT ||
+        extra_len < 0 || extra_len > gy_extra_limit(algo) ||
+        check_len <= 0 || check_len > GYHOST_HASH_MAX_CHECK ||
+        iter < 0 || key_len < 0) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (iv_len < 0 || iv_len > 16 || (iv_len > 0 && iv == NULL)) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (!gyhost_hash_supported(algo)) {
+        return GYHOST_CUDA_ERR_ALGO;
+    }
+    for (int i = 0; i < count; i++) {
+        if (pw_len[i] < 0 || pw_len[i] > GY_MAX_PW) {
+            return GYHOST_CUDA_ERR_PARAM;
+        }
+        if (algo == GYHOST_HASH_RAR3HP && pw_len[i] > GY_RAR3_MAX_PW16) {
+            return GYHOST_CUDA_ERR_PARAM;
+        }
+        if (pw_off[i] < 0 || pw_off[i] > pw_total - pw_len[i]) {
+            return GYHOST_CUDA_ERR_PARAM;
+        }
+    }
+
+    return gy_pipe_submit(algo, 0, pw_data, pw_total, pw_off, pw_len, count,
+                          salt, salt_len, extra, extra_len, check, check_len,
+                          iv, iv_len, iter, key_len, device, handle);
+}
+
+/*
+ * gyhost_cuda_verify_begin — crypt 目标（$1$/$5$/$6$）的异步批量校验。
+ *
+ * 参数与 gyhost_cuda_verify 相同，用 handle（出参，槽位下标）代替 match。
+ * 与通用哈希版一样不做提前结束：整批候选都会算完。
+ */
+int gyhost_cuda_verify_begin(int algo, const char *pw_data, int pw_total,
+                             const int *pw_off, const int *pw_len, int count,
+                             const char *salt, int salt_len, int rounds,
+                             const char *key, int device, int *handle) {
+    if (pw_data == NULL || pw_off == NULL || pw_len == NULL || salt == NULL ||
+        key == NULL || handle == NULL) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (count <= 0 || count > (1 << 20)) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (pw_total < 0 || salt_len < 0 || salt_len > GY_MAX_SALT || rounds < 0) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (!gyhost_cuda_supported(algo)) {
+        return GYHOST_CUDA_ERR_ALGO;
+    }
+    const int key_len = (int) strlen(key);
+    if (key_len <= 0) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    for (int i = 0; i < count; i++) {
+        if (pw_len[i] < 0 || pw_len[i] > GY_MAX_PW) {
+            return GYHOST_CUDA_ERR_PARAM;
+        }
+        if (pw_off[i] < 0 || pw_off[i] > pw_total - pw_len[i]) {
+            return GYHOST_CUDA_ERR_PARAM;
+        }
+    }
+
+    /* crypt 密文按 NUL 结尾字符串放进 check 槽（check_len 含结尾的 0） */
+    return gy_pipe_submit(algo, 1, pw_data, pw_total, pw_off, pw_len, count,
+                          salt, salt_len, NULL, 0, key, key_len + 1,
+                          NULL, 0, rounds, 0, device, handle);
+}
+
+/* begin/end 共用的收尾：等事件、读回最小命中下标。 */
+static int gy_pipe_collect(int handle, int device, int *match) {
+    if (handle < 0) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    const int sel = handle & 0xff;
+    const int gen = handle >> 8;
+    if (sel < 0 || sel >= GY_PIPE_SLOTS || gen <= 0) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    pthread_mutex_lock(&gy_cache_lock);
+    gy_pipe_slot *s = &gy_pipes[(device >= 0 && device < GY_CACHE_SLOTS) ? device : 0].slot[sel];
+    int rc = GYHOST_CUDA_OK;
+    if (gen == s->gen) {
+        if (!s->busy) {
+            rc = GYHOST_CUDA_ERR_PARAM;
+        } else if (cudaEventSynchronize(s->ev) != cudaSuccess) {
+            rc = GYHOST_CUDA_ERR_KERNEL;
+        } else {
+            int best = 0;
+            if (cudaMemcpy(&best, s->d_match, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                rc = GYHOST_CUDA_ERR_KERNEL;
+            } else {
+                *match = (best >= 0 && best < s->count) ? best : -1;
+            }
+            s->busy = 0;
+        }
+    } else if (s->has_pending && s->pending_gen == gen) {
+        /* 该批在提交新批次时被抢占，结果已经存下来了 */
+        *match = s->pending_match;
+        s->has_pending = 0;
+    } else {
+        /* 结果早已被后续批次覆盖，调用方应回退 CPU 复核该批 */
+        rc = GYHOST_CUDA_ERR_PARAM;
+    }
+    pthread_mutex_unlock(&gy_cache_lock);
+    if (rc != GYHOST_CUDA_OK) {
+        cudaGetLastError();
+    }
+    return rc;
+}
+
+int gyhost_cuda_verify_hash_end(int handle, int device, int *match) {
+    if (match == NULL) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    return gy_pipe_collect(handle, device, match);
+}
+
+int gyhost_cuda_verify_end(int handle, int device, int *match) {
+    if (match == NULL) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    return gy_pipe_collect(handle, device, match);
 }

@@ -48,6 +48,7 @@ extern "C" {
 #define GYHOST_HASH_RAR3HP 131 /* RAR3 -hp 头加密（-m 12500） */
 #define GYHOST_HASH_7Z 140     /* 7z AES-256，仅 Copy 编码器（-m 11600 的子集） */
 #define GYHOST_HASH_PDF 150    /* 加密 PDF 口令校验（-m 10400/10500/10600/10700） */
+#define GYHOST_HASH_OFFICE 160 /* 加密 Office 文档口令校验（-m 9400/9500/9600） */
 
 /*
  * 通用哈希各字段的长度上限（与 internal/cuda 的 MaxHash* 一致）。
@@ -58,6 +59,21 @@ extern "C" {
 #define GYHOST_HASH_MAX_SALT 64
 #define GYHOST_HASH_MAX_DATA 384
 #define GYHOST_HASH_MAX_CHECK 64
+
+/*
+ * 需要整段下发的密文上限：WinZip AES（-m 13600）的 10 字节认证码覆盖整段密文，
+ * 7z AES-256（Copy 编码器）也要整段解密，两者都必须拿到全部密文才能校验，
+ * 所以不受 GYHOST_HASH_MAX_DATA 限制。Go 侧 MaxCipherDataLen 必须与此一致。
+ * （ZipCrypto 只需 12 字节头部，RAR3-hp 只要 16 字节，都远在通用上限之内。）
+ */
+#define GYHOST_HASH_MAX_CIPHER_DATA 1048576
+
+/*
+ * WPA2 四次握手（-m 22000 的 WPA*02*）的 EAPOL 帧上限：内核要对整帧算 MIC，
+ * 帧必须完整下发，而真实抓包里 M2/M4 常见 100~1500 字节。
+ * Go 侧 MaxEAPOLDataLen 必须与此一致。
+ */
+#define GYHOST_HASH_MAX_EAPOL_DATA 65536
 
 
 /* ============================ 设备查询 ============================ */
@@ -143,8 +159,8 @@ int gyhost_cuda_check_hash(int algo, const char *pw, int pw_len,
  *   iter             RAR5/7z 的 KDF power（RAR3 固定 2^18 轮，忽略）
  *   key_len          ZIP AES 的密钥长度 / 7z 的解压后字节数
  *
- * 注意：RAR3 与 7z 的候选密码按 UTF-16LE 编码传入（pw_len 为编码后的字节数），
- * 由 internal/cuda 在 Go 侧完成转换。
+ * 注意：RAR3、7z 与 Office 的候选密码按 UTF-16LE 编码传入（pw_len 为编码后的
+ * 字节数），由 internal/cuda 在 Go 侧完成转换。
  */
 int gyhost_cuda_verify_hash(int algo,
                             const char *pw_data, int pw_total,
@@ -155,6 +171,55 @@ int gyhost_cuda_verify_hash(int algo,
                             const char *iv, int iv_len,
                             int iter, int key_len,
                             int device, int *match);
+
+/*
+ * gyhost_cuda_verify_hash_begin — 异步版批量校验：上传候选并发射内核后立即返回。
+ *
+ * 参数与 gyhost_cuda_verify_hash 相同，但用 handle（出参，槽位下标 0/1）代替 match。
+ * 返回 GYHOST_CUDA_OK 表示已提交；之后用 gyhost_cuda_verify_hash_end 取结果。
+ * 与同步版的区别：不做分块提前结束，整批候选都会算完（命中最小子标由设备端
+ * atomicMin 保证）。
+ */
+int gyhost_cuda_verify_hash_begin(int algo,
+                                  const char *pw_data, int pw_total,
+                                  const int *pw_off, const int *pw_len, int count,
+                                  const char *salt, int salt_len,
+                                  const char *extra, int extra_len,
+                                  const char *check, int check_len,
+                                  const char *iv, int iv_len,
+                                  int iter, int key_len,
+                                  int device, int *handle);
+
+/*
+ * gyhost_cuda_verify_hash_end — 等 gyhost_cuda_verify_hash_begin 提交的那批完成，
+ * 读回首个命中的候选下标（无命中为 -1）。handle/device 必须与 begin 一致。
+ */
+int gyhost_cuda_verify_hash_end(int handle, int device, int *match);
+
+/*
+ * gyhost_cuda_verify_begin — crypt 目标（$1$/$5$/$6$）的异步批量校验：上传候选并
+ * 发射内核后立即返回，参数与 gyhost_cuda_verify 相同，用 handle（出参）代替 match。
+ * 提交后必须配对 gyhost_cuda_verify_end 取结果（handle/device 要一致）。
+ *
+ * 与同步版的区别：不做分块提前结束，整批候选都会算完（命中最小下标由设备端
+ * atomicMin 保证），换来主机与设备并行。
+ */
+int gyhost_cuda_verify_begin(int algo,
+                             const char *pw_data, int pw_total,
+                             const int *pw_off, const int *pw_len, int count,
+                             const char *salt, int salt_len, int rounds,
+                             const char *key, int device, int *handle);
+
+/* 等 gyhost_cuda_verify_begin 提交的那批完成，读回首个命中下标（无命中为 -1）。 */
+int gyhost_cuda_verify_end(int handle, int device, int *match);
+
+/*
+ * gyhost_cuda_pipeline_slots — 异步流水线可同时在飞的批次数上限。
+ *
+ * 调用方（Go 侧）应据此确定同时在飞批次的环大小，超过这个数再提交就会在
+ * begin 里阻塞等最老的槽位，GPU 在主机准备下一批时空转。
+ */
+int gyhost_cuda_pipeline_slots(void);
 
 /* 通用哈希算法编号是否受支持。 */
 int gyhost_hash_supported(int algo);

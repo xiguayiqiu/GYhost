@@ -24,6 +24,24 @@ func verifyHashNative(algo int, data []byte, offs, lens []int32, salt, extra, ch
 	return -1, ErrNotCompiled
 }
 
+func verifyHashBeginNative(algo int, data []byte, offs, lens []int32, salt, extra, check, iv []byte, iter, keyLen, device int) (int, error) {
+	return -1, ErrNotCompiled
+}
+
+func verifyHashEndNative(handle, device int) (int, error) {
+	return -1, ErrNotCompiled
+}
+
+func verifyBeginNative(algo int, data []byte, offs, lens []int32, salt string, rounds int, key string, device int) (int, error) {
+	return -1, ErrNotCompiled
+}
+
+func verifyEndNative(handle, device int) (int, error) {
+	return -1, ErrNotCompiled
+}
+
+func pipelineSlotsNative() int { return 0 }
+
 func checkHashNative(algo int, password string, salt, extra, check, iv []byte, iter, keyLen int) (int, error) {
 	return 0, ErrNotCompiled
 }

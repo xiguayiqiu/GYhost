@@ -171,12 +171,27 @@ const zipAESIter = 1000
 const authCodeLen = 10
 
 // parseZIPAES 解析 $zip2$*type*strength*magic*salt*verify*len*cipher*auth*$/zip2$。
+//
+// 字段顺序与 hashcat 的 13600 文档一致（也正是 hashdump 产出的形态）。注意
+// TrimPrefix 去掉 "$zip2$" 之后 body 仍以 '*' 开头，所以下标整体后移一位：
+//
+//	$zip2$*0*3*0*b022a3b1ff45551f97971ba9ca9efe23*1d03*10*8a87…*5a8fb140c28cee8ab062*$/zip2$
+//	    f[1]   f[2]  f[3]  f[4]                   f[5]   f[6] f[7] f[8]
+//	     │      │     │     │                      │      │    │    └ 10 字节认证码
+//	     │      │     │     │                      │      │    └────── 密文（可为空）
+//	     │      │     │     │                      │      └─────────── 密文字节数
+//	     │      │     │     │                      └────────────────── 2 字节口令校验值
+//	     │      │     │     └──────────────────────────────────────────── 16 字节盐
+//	     │      │     └────────────────────────────────────────────────── magic（0=文件内容 1=注释）
+//	     │      └──────────────────────────────────────────────────────── 密钥强度（1/2/3 → AES-128/192/256）
+//	     └─────────────────────────────────────────────────────────────── type（0 = WinZip AES）
 func parseZIPAES(h string) (*Target, error) {
 	if !strings.HasPrefix(h, "$zip2$") || !strings.HasSuffix(h, "$/zip2$") {
 		return nil, errSyntax(h)
 	}
 	body := strings.TrimSuffix(strings.TrimPrefix(h, "$zip2$"), "$/zip2$")
 	f := strings.Split(body, "*")
+	// f[0] 是前导 '*' 切出的空串，f[len-1] 是末尾 '*' 切出的空串
 	if len(f) < 9 {
 		return nil, errSyntax(h)
 	}
@@ -202,19 +217,29 @@ func parseZIPAES(h string) (*Target, error) {
 	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
 		return nil, errSyntax(h)
 	}
-	if len(verify) < 2 || len(auth) < authCodeLen || len(cipher) == 0 || len(salt) == 0 {
+	if len(verify) < 2 || len(auth) < authCodeLen || len(salt) == 0 {
 		return nil, errSyntax(h)
+	}
+	// 认证码覆盖整段密文：CPU 侧拿完整密文算，GPU 侧有 MaxCipherDataLen 的上限。
+	// 两种边界都不挂 GPU 目标：密文为空（加密的空文件，只剩 2 字节口令校验值，
+	// 内核判不出来）或超长（截断后认证码必然不符），都交给 CPU。
+	var gpuCipher []byte
+	if len(cipher) > 0 && len(cipher) <= cuda.MaxCipherDataLen {
+		gpuCipher = cipher
 	}
 
 	check := make([]byte, 0, 2+authCodeLen)
 	check = append(check, verify[:2]...)
 	check = append(check, auth[:authCodeLen]...)
 
-	return &Target{
+	t := &Target{
 		Raw: h, Kind: KindZIPAES, Mode: 13600,
 		Check: &zipAESChecker{keyLen: keyLen, salt: salt, verify: verify[:2], cipher: cipher, auth: auth[:authCodeLen]},
-		GPU:   &cuda.HashTarget{Algo: cuda.HashZIPAES, Salt: salt, Data: cipher, Check: check, KeyLen: keyLen},
-	}, nil
+	}
+	if gpuCipher != nil {
+		t.GPU = &cuda.HashTarget{Algo: cuda.HashZIPAES, Salt: salt, Data: gpuCipher, Check: check, KeyLen: keyLen}
+	}
+	return t, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +308,7 @@ type zipCryptoChecker struct {
 // 避免 1 字节校验带来的误报。
 func (c *zipCryptoChecker) Check(pw string) bool {
 	plain := decryptZipCrypto(initZipCrypto(pw), c.data)
-	if len(plain) <= 12 {
+	if len(plain) < 12 {
 		return false
 	}
 	if c.oneByte {
@@ -338,7 +363,8 @@ func parseZipCrypto(h string) (*Target, error) {
 	if ct != methodStored && ct != methodDeflate {
 		return nil, errSyntax(h)
 	}
-	if len(data) <= 12 {
+	// 12 字节就是加密头本身（空文件），合法
+	if len(data) < 12 {
 		return nil, errSyntax(h)
 	}
 
@@ -355,6 +381,8 @@ func parseZipCrypto(h string) (*Target, error) {
 		data:    data,
 	}
 	// GPU 侧只能比对头部 1~2 字节（弱校验），命中后由 crack.go 用 CPU 完整复核。
+	// 内核解密的就是这 12 个字节，所以只把它们下发：条目再大也不会撞上
+	// HashTarget 对 Data 的长度上限，Validate 也就不会把 GPU 目标否掉。
 	b := 2
 	if oneByte {
 		b = 1
@@ -362,7 +390,7 @@ func parseZipCrypto(h string) (*Target, error) {
 	gpuCheck := make([]byte, 4)
 	binary.LittleEndian.PutUint16(gpuCheck[0:2], uint16(cs))
 	binary.LittleEndian.PutUint16(gpuCheck[2:4], uint16(tc))
-	gpu := &cuda.HashTarget{Algo: cuda.HashZipCrypto, Data: data, Check: gpuCheck, Iter: b}
+	gpu := &cuda.HashTarget{Algo: cuda.HashZipCrypto, Data: data[:12], Check: gpuCheck, Iter: b}
 	if err := gpu.Validate(); err != nil {
 		gpu = nil
 	}
@@ -547,15 +575,24 @@ func parse7z(h string) (*Target, error) {
 	// 仅 Copy 编码器（无需解压）可交给 GPU；LZMA/Deflate 必须解压，回退 CPU。
 	var gpu *cuda.HashTarget
 	if datatype == z7Copy {
+		// 内核按 AES-128-CBC 逐块解密，要求密文长度是 16 的倍数；真实条目的
+		// 压缩流长度通常不是，补零到整块即可——校验只看前 unpack 字节的 CRC32，
+		// 补出来的尾巴落在数据之后，不影响结果。
+		gpuData := data
+		if pad := len(gpuData) % 16; pad != 0 {
+			gpuData = append(append([]byte{}, gpuData...), make([]byte, 16-pad)...)
+		}
 		gt := &cuda.HashTarget{
 			Algo:   cuda.Hash7z,
 			Salt:   salt,
-			Data:   data,
+			Data:   gpuData,
 			Check:  []byte{byte(crcVal), byte(crcVal >> 8), byte(crcVal >> 16), byte(crcVal >> 24)},
 			IV:     iv,
 			Iter:   power,
 			KeyLen: int(unpack),
 		}
+		// 密文可能很大（内核要整段解密），超长才放弃 GPU；历史上按 384 字节的
+		// 通用上限卡，导致几乎所有真实 7z 条目都静默退回 CPU。
 		if err := gt.Validate(); err == nil {
 			gpu = gt
 		}

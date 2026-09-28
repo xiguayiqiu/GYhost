@@ -40,6 +40,8 @@ gyhost shadow -i /etc/shadow -m '?d?d?d?d'      # 掩码穷举，实时生成候
 
 - 支持哈希：`$1$` md5crypt、`$5$`/`$6$` sha-crypt（含 rounds）、`$2*$` bcrypt、`$y$` yescrypt、`$argon2*$`、`$pbkdf2-*$`、`$scrypt$`
 - 多线程并发、可按用户过滤、支持 GPU 加速（`--gpu` 需 root/管理员）
+  GPU 只覆盖 `$1$` md5crypt / `$5$` sha256crypt / `$6$` sha512crypt 三种算法；
+  bcrypt、yescrypt、argon2、scrypt、pbkdf2 没有 CUDA 内核，仍走 CPU，混用时会打印提示
 - 候选来源二选一：`-p` 字典，或 `-m` 掩码（hashcat 风格表达式，见下）
 - 可选将结果以 `user:password` 写入文件
 
@@ -112,12 +114,40 @@ gyhost hashac -i hashes.txt -m '?l?l?d?d'       # 掩码穷举，实时生成候
 ```
 
 - 裸摘要：MD5 / SHA-1 / SHA-256 / SHA-512
-- 复合格式：WPA2-PMKID/EAPOL（`-m 22000`）、RAR5（`-m 13000`）、ZIP-AES（`-m 13600`）、ZipCrypto（`-m 17200`/`17210`）、7z（`-m 11600`）、加密 PDF（`-m 10400`/`10500`/`10600`/`10700`）
+- 复合格式：WPA2-PMKID/EAPOL（`-m 22000`）、RAR5（`-m 13000`）、ZIP-AES（`-m 13600`）、ZipCrypto（`-m 17200`/`17210`）、7z（`-m 11600`）、加密 PDF（`-m 10400`/`10500`/`10600`/`10700`）、加密 Office 文档（`$office$` → `-m 9400` 标准加密 / `-m 9500` agile SHA-1 / `-m 9600` agile SHA-512）
+  `$oldoffice$`（Word/Excel 97-2003，hashcat `-m 9700`/`9800`）暂不支持，遇到会明确报错而不是静默跳过
+- WPA-Enterprise（WPE）与家用 WPA/WPA2 走同一条 hc22000 路径，抓包里的四次握手都按 `WPA*02*` 处理（个人版的 PMKID 走 `WPA*01*`）；
+  John the Ripper 的 `$wpe$` / `wpa_pmkid+eapolv2` 私有格式未实现（hashcat 同样不支持）
 - 其中 `$...$` 格式可由 `hashdump` 直接从加密压缩包生成，两者可串联使用
 - 加密 PDF 的 `/U`（用户口令）与 `/O`（所有者口令）都会尝试——命中任一即可打开该 PDF；
   已用 hashcat v7.1.2 的 10400/10500/10600/10700 逐条实测对齐（注意 hashcat 只校验用户口令）
 - 候选来源二选一：`-p` 字典，或 `-m` 掩码（hashcat 风格表达式，见下）
 - 支持 GPU 加速（`--gpu` 需 root/管理员）与并发；加密 PDF 的 10400/10500/10600 走 CUDA 内核（10700 见上）
+- 走 GPU 的类型：7z Copy 编码器、zip 的 ZipCrypto 与 WinZip AES、RAR5/RAR3、rar 之外的裸摘要、
+  WPA2、PDF 10400/10500/10600、Office `$office$` 9400/9500/9600。留在 CPU 的目标会说明原因（如 7z 的 LZMA 条目需解压、
+  密文超过 1 MiB）；`-m 10700` 默认留 CPU，`GYHOST_PDF_R6_GPU=1` 可强制用 GPU
+- WPA2（`-m 22000`）的 PMKID 与 EAPOL 两种形态都走 GPU：EAPOL 帧要整帧下发，
+  上限 64 KiB（hashcat 自己的 hc22000 解析只接受 256 字节以内的 EAPOL 字段，
+  `hashdump` 从抓包转出来的行可能更长，这类目标以前会被 384 字节通用上限挡回 CPU）
+
+### GPU 怎么跑满（shadow / hashac 通用）
+
+`--gpu` 启动时先做两件事，否则速度会明显低于 hashcat：
+
+- **唤醒显卡**：消费级显卡空载会停在低功耗档（P8，本机实测核心频率只有 210 MHz），
+  NVIDIA 驱动只对「持续」的负载提频。所以爆破前会先用真实目标连续打满约 0.4 秒
+  （stderr 提示「正在唤醒 GPU…」），让频率升到最高档再正式开跑；顺带完成内核加载。
+- **多批流水线**：单 GPU 目标时最多 8 批同时在飞（`cuda.PipelineSlots()` 与 native 槽位对齐），
+  批大小 131072。提交下一批用的是页锁定（pinned）内存，`cudaMemcpyAsync` 真正异步，
+  主机准备下一批时 GPU 一直在算上一批——批与批之间不留空档，显卡才不会掉回低功耗档。
+  多 GPU 目标退回逐目标同步路径。
+
+两个模块都遵循同一条规则：**任何一批候选只要没能确认校验结果（GPU 出错、槽位被抢占），
+就整批交给 CPU 复核**，宁可慢一点也不漏解。超长候选（超过 255 字节）本来就只能由 CPU 校验。
+
+`internal/cuda` 的静态库默认用 `-arch=native` 编译：直接生成与本机 GPU 匹配的 cubin。
+不给架构时只嵌入 PTX，驱动要在首次启动内核时现场 JIT 整个模块（本机实测接近一分钟，
+表现为「--gpu 跑起来先卡住」）。交叉编译请显式指定，例如 `make cuda-lib ARCH=sm_86`。
 
 ## 掩码（暴力枚举）
 
