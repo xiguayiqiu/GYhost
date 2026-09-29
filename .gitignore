@@ -2,8 +2,13 @@
 # GYhost .gitignore
 # ============================================================================
 # 原则：仓库里只放「项目源码 + 构建脚本 + 文档」。
-#   保留：*.go、*.cu、*.h、Makefile、go.mod/go.sum、build.sh、README.md、本文件
+#   保留：*.go、*.cu、*.h、go.mod/go.sum、build.sh、clean.sh、CMakeLists.txt、
+#         cmake/、README.md、本文件
 #   忽略：编译产物、运行/测试数据、第三方参考代码
+#
+# 构建系统已从 Makefile 迁移到 CMakeLists.txt，故不再有 Makefile 入库；
+# 但 in-source 配置（cmake . 不带 -B）会在根目录生成同名 Makefile，
+# 需要单独忽略，避免与已删除的手写版混淆。
 #
 # 分组如下；新增条目请归入对应分组并说明原因，避免以后看不懂为什么被忽略。
 # 若某个被忽略的文件确实需要入库，用 `git add -f <file>` 强制添加。
@@ -12,16 +17,37 @@
 # 编译产物
 # ---------------------------------------------------------------------------
 
-# 根目录可执行文件（make / go build 的输出）
+# 根目录可执行文件（go build / cmake --build 的输出）
 /gyhost
 /gyhost.exe
 /Test/
+
+# CMake 构建目录（cmake -S . -B build 产生的一切）
+/build/
+/build-*/
+/build-dist/
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/CTestTestfile.cmake
+compile_commands.json
+
+# in-source 配置会在源码目录生成同名 Makefile（首行 "CMAKE generated file"），
+# 覆盖/冒充已删除的手写版。按名字忽略可避免误提交。
+# 注意：只忽略 /Makefile 与 /internal/cuda/Makefile 这两个已知路径，
+# 不要写裸的 Makefile，否则任何子目录的 Makefile 都会被吞掉。
+/Makefile
+/internal/cuda/Makefile
+
+# internal/cuda/CMakeFiles/：CUDA 静态库必须输出到该源码目录（cgo 的 -L${SRCDIR} 要求），
+# CMake 的中间目录也会跟着落在这里，需单独排除。
+/internal/cuda/CMakeFiles/
 
 # build.sh 生成的多平台发布产物
 /dist/
 
 # CUDA 静态库与编译中间目标文件
-# 由 internal/cuda/Makefile 生成（cuda.o -> libgyhost_cuda.a）
+# 由 internal/cuda/CMakeLists.txt 生成（cuda.cu.o -> libgyhost_cuda.a）
 *.o
 *.a
 
@@ -61,7 +87,7 @@ coverage.*
 # freeclient 是另一个独立 Go 模块（自带 go.mod），与 GYhost 无关
 /freeclient/
 
-# cuda_kernel 是 CUDA 参考实现（不参与构建：根 Makefile 只编译 internal/cuda）
+# cuda_kernel 是 CUDA 参考实现（不参与构建：根 CMakeLists.txt 只编 internal/cuda）
 /cuda_kernel/
 
 # 依赖副本（若将来执行 go mod vendor，依赖代码同样不属于项目源码）

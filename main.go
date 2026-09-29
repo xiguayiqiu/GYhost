@@ -9,9 +9,12 @@ import (
 
 	"gyhost/internal/cli"
 	"gyhost/internal/module"
+	"gyhost/internal/platformmods"
 	"gyhost/modules/hashac"
 	"gyhost/modules/hashcat"
 	"gyhost/modules/hashdump"
+	"gyhost/modules/mem"
+	"gyhost/modules/net"
 	"gyhost/modules/shadow"
 )
 
@@ -23,6 +26,13 @@ func main() {
 	registry.MustRegister(hashdump.New())
 	registry.MustRegister(hashcat.New())
 	registry.MustRegister(hashac.New())
+	registry.MustRegister(net.New())
+	registry.MustRegister(mem.New())
+
+	// 平台相关的模块（当前只有 proc）由 internal/platformmods 按构建标签注册，
+	// 那个包内部拆成 proc.go / proc_off.go 两个同签名实现。
+	platformmods.Register(registry)
+
 	// registry.MustRegister(<新模块>.New())
 
 	os.Exit(cli.New(registry).Run(os.Args[1:]))

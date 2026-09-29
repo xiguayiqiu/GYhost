@@ -17,7 +17,8 @@ import (
 // 本文件是 internal/cuda 的 cgo 绑定，仅在 -tags cuda 时参与编译；
 // 未启用 CUDA 的构建见 cuda_stub.go。
 //
-// 依赖同目录下由 make -C internal/cuda 生成的 libgyhost_cuda.a。
+// 依赖同目录下由 `cmake --build <dir> --target cuda-lib`（或直接构建 gyhost 目标）
+// 生成的 libgyhost_cuda.a。
 
 func compiled() bool { return true }
 

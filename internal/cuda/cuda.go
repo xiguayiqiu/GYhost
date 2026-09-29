@@ -7,8 +7,8 @@
 //
 // 构建：
 //
-//	make -C internal/cuda      # 生成 libgyhost_cuda.a（需要 nvcc）
-//	go build -tags cuda        # 编译启用 CUDA 的二进制
+//	cmake -S . -B build && cmake --build build   # 自动探测 nvcc，装了就带 CUDA
+//	go build -tags cuda                          # 编译启用 CUDA 的二进制
 //
 // 不带 -tags cuda 的普通构建同样可编译，此时 Compiled() 返回 false、
 // Verify 返回 ErrNotCompiled，调用方据此回退 CPU 实现。

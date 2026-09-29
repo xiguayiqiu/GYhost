@@ -82,6 +82,10 @@ func lookup(l Lang, key string) (string, bool) {
 	if s, ok := messages[l][key]; ok && s != "" {
 		return s, true
 	}
+	// 平台相关的文案（如 proc）只在该平台存在时才有
+	if s, ok := procMessages[l][key]; ok && s != "" {
+		return s, true
+	}
 	if l != DefaultLang {
 		if s, ok := messages[DefaultLang][key]; ok && s != "" {
 			return s, true
@@ -576,6 +580,820 @@ var messages = map[Lang]map[string]string{
 		"hashac.report.pending":    "[!] 未破解 (%s): %s",
 		"hashac.report.hint":       "[!] 可尝试更大的字典或针对性的规则后再跑一次",
 		"hashac.report.all_done":   "[+] 全部目标已破解",
+
+		// ==================== net 模块 ====================
+		"net.group":   "网络分析",
+		"net.summary": "离线分析 pcap/cap 抓包：协议、会话、DNS/TLS/HTTP 与明文安全发现",
+
+		"net.flag.input":           "抓包文件路径（pcap/pcapng/cap，可重复；给目录时扫描其中的抓包文件）",
+		"net.flag.out":             "把报告写入该文件（默认打印到 stdout）",
+		"net.flag.list":            "逐包列出（默认输出统计报告）",
+		"net.flag.filter":          "过滤表达式，作用于统计与列表，如: -f \"tcp and port 443\"",
+		"net.flag.top":             "各统计表最多显示的条目数（默认 10）",
+		"net.flag.limit":           "列表模式下最多列出的包数（0 表示不限）",
+		"net.flag.quiet":           "静默模式，不向 stderr 输出提示",
+		"net.flag.section":         "只输出报告的指定章节，逗号分隔，可重复（io/proto/conv/endpoints/ports/dns/sni/http/findings/attack/all）",
+		"net.flag.json":            "输出 JSON 而非人读报告，便于 jq 等工具二次处理",
+		"net.flag.time":            "时间范围过滤：绝对时刻 10:05:00-10:06:00，或相对首帧的秒数 30-90",
+		"net.flag.interval":        "时间线桶粒度（秒），仅配合 -z timeline（默认 1）",
+		"net.section.timeline":     "流量时间线",
+		"net.tl.interval":          "分桶粒度",
+		"net.tl.interval_desc":     "%.0f 秒",
+		"net.tl.span":              "时间跨度",
+		"net.tl.span_desc":         "%s，共 %d 桶",
+		"net.tl.avg":               "平均速率",
+		"net.tl.avg_desc":          "%.1f 包/秒",
+		"net.tl.peak":              "峰值时刻",
+		"net.tl.peak_desc":         "第 %.0f 秒，%d 包 / %s",
+		"net.tl.peak_peer":         "峰值来源",
+		"net.tl.capped":            "时间线桶数已达上限 %d，超出部分未统计；请用 -I 增大粒度",
+		"net.tl.rows":              "共 %d 个有流量的时间桶，此处只显示前 %d 个（用 --top 调整）",
+		"net.tl.col_t":             "时刻(s)",
+		"net.tl.col_pkt":           "包数",
+		"net.tl.col_bytes":         "流量",
+		"net.tl.col_proto":         "主要协议",
+		"net.err.bad_section":      "未知的 -z 章节: %s（可用: io/timeline/proto/conv/endpoints/ports/dns/sni/http/findings/attack/follow/all）",
+		"net.err.bad_follow":       "无法识别的 -z follow 参数: %s（格式: ascii/raw/hex，可选会话序号）",
+		"net.err.time_range":       "无法识别的时间范围: %s（例: 10:05:00-10:06:00 或 30-90）",
+		"net.err.time_range_order": "时间范围的结束早于开始",
+		"net.err.json_tui":         "-j 与 -T 不能同时使用（JSON 面向管道，交互界面会被其输出冲掉）",
+		"net.err.list_section":     "-l 与 -z 不能同时使用（列表模式是逐包流式输出，没有章节概念）",
+		"net.section.follow":       "TCP 会话追踪",
+		"net.follow.stream":        "会话 #%d/%d  %s",
+		"net.follow.from":          "方向 0（%s）：",
+		"net.follow.to":            "方向 1（%s）：",
+		"net.follow.empty":         "（无载荷）",
+		"net.follow.truncated":     "该会话载荷超出重组上限，内容不完整",
+		"net.follow.gaps":          "重组发现 %d 处缺号，缺失部分已用 0 填充",
+		"net.follow.no_stream":     "没有可追踪的 TCP 会话（需要 TCP 且带载荷）",
+		"net.follow.no_index":      "会话序号 %d 越界（共有 %d 条）",
+		"net.atk.capped":           "统计触到映射上限，部分指标不完整",
+		"net.flag.model":           "启用攻击分析模型，逗号分隔（syn/udp/icmp/flood/cc/loss/frag/all），如: -m syn,cc",
+
+		"net.usage": `gyhost net - 离线分析 pcap/cap 抓包文件的网络流量
+
+用法:
+  gyhost net -i [抓包文件] [选项...]
+
+参数（按用途分组，每项只讲作用；详细语法见下方各节）:
+
+  输入与输出
+    -i, -input    抓包文件路径；可重复，给目录时扫描其中的抓包
+    -o, -out      把报告写入文件，stdout 保持干净
+    -q, -quiet    不向 stderr 输出提示与告警
+
+  收敛分析范围
+    -f, -filter   过滤表达式，作用于统计与列表
+    -t, -time     时间范围过滤
+    -n, -limit    列表模式最多列出多少个包（0 表示不限）
+    -I, -interval 时间线分桶粒度（秒），仅配合 -z timeline
+    --top N       各统计表最多显示的条目数（默认 10）
+
+  选择输出形式（互斥；默认输出统计报告）
+    -l, -list     逐包列出：序号、相对时间、端点、协议、长度、摘要
+    -V, -verbose  逐包协议树：按 tshark -V 列出每个字段与 hexdump
+    -T, -tui      交互式全屏抓包浏览器
+    -j, -json     JSON 结构化输出，便于 jq 等工具二次处理
+
+  启用分析模型
+    -m, -model    攻击分析模型，见"攻击模型"
+
+  裁剪报告章节
+    -z, -section  只输出指定章节，见"报告章节"
+
+过滤语法 (-f):
+  简写形式
+    空格分隔的多个条件取"与"，or 取"或"，not 取反
+    条件        协议名（tcp/udp/icmp/arp/dns/http/tls/ssh…）
+                [src|dst] host IP      [src|dst] port 端口
+                纯数字等价于 port N
+  显示过滤器形式（Wireshark 风格）
+    表达式      字段 运算符 值        运算符: == != > < >= <= contains
+    逻辑        && || ! 与括号 ()     裸写协议名表示"存在"
+    字段        frame.*  ip.*  ipv6.*  tcp.*  udp.*  icmp.*  arp.*
+                http.*  dns.*  tls.*  eth.*
+    交互界面里按 / 可边输入边提示，按 ? 查看全部字段
+
+时间范围 (-t):
+  绝对时刻    10:05:00-10:06:00
+  相对秒数    30-90（相对首帧；也可只给一端）
+
+报告章节 (-z):
+  io          抓包概览
+  proto       协议分布
+  conv        会话
+  endpoints   端点
+  ports       端口
+  dns         DNS 查询
+  sni         TLS SNI
+  http        HTTP 主机与请求
+  findings    安全发现
+  attack      攻击分析
+  all         以上全部
+  timeline    流量时间线（按时间桶看包数与流量，定位突发与静默）
+  会话追踪    follow,tcp,ascii|raw|hex[,<序号>]
+              把乱序/重传/分段的报文按 TCP 序号拼回两个方向的字节流
+              ascii 可打印字符   raw 转义原始字节   hex hexdump
+  别名        phs=proto   conv=flows   ep=endpoints   tls=sni   stream=follow
+
+攻击模型 (-m):
+  syn    SYN 洪泛与源 IP 随机化/伪造
+  udp    UDP 洪泛
+  icmp   ICMP 洪泛
+  flood  通用洪泛（syn + udp + icmp）
+  cc     CC 攻击（HTTP 层速率/单源/分布式）
+  loss   丢包与 TCP 传输异常（重传/重复 ACK/零窗口/截断）
+  frag   IP 分片异常（重叠/畸形，泪滴类）
+  all    以上全部（-m 留空等价于 all）
+
+分析内容:
+  抓包概览、四层协议分布、会话/主机/端口 TOP、DNS 查询、TLS SNI、
+  明文 HTTP 主机与请求 URI，以及安全发现（明文凭据、HTTP 口令字段、
+  ARP 冲突、未加密的明文协议流量）
+  指定 -m 时额外输出逐模型判定（命中/疑似/未命中）、关键指标与命中迹象
+
+输出:
+  报告与列表 -> stdout，提示与告警 -> stderr（2>/dev/null 只看报告）
+  指定 -o 时报告写入文件（不含颜色码），stdout 不再输出
+  TUI 的完整按键与过滤说明见界面内的 ? 面板
+
+示例:
+  基础
+    gyhost net -i capture.pcap
+    gyhost net -i capture.pcap --top 20
+
+  过滤
+    gyhost net -i capture.pcap -f "host 10.0.0.5"
+    gyhost net -i capture.pcap -f "tcp.port == 443 && !http"
+    gyhost net -i capture.pcap -t 30-90 -f "udp"
+
+  逐包查看
+    gyhost net -i capture.pcap -l -n 50
+    gyhost net -i capture.pcap -V -n 5 -f "port 22"
+
+  交互浏览
+    gyhost net -i capture.pcap -T -f "tcp"
+
+  脚本化分析
+    gyhost net -i capture.pcap -j | jq ".conversations | sort_by(-.packets) | .[0]"
+    gyhost net -i capture.pcap -j -z http | jq ".http.credentials"
+    gyhost net -i capture.pcap -z dns,http
+
+  会话重组与时间线
+    gyhost net -i capture.pcap -z "follow,tcp,ascii,0"
+    gyhost net -i capture.pcap -z timeline            # 按秒看流量起伏
+    gyhost net -i capture.pcap -z timeline -I 5       # 5 秒一桶
+
+  攻击分析
+    gyhost net -i capture.pcap -m all
+    gyhost net -i capture.pcap -m syn,cc`,
+
+		// ---- net 错误 ----
+		"net.err.missing_args":          "缺少必填参数: -i [抓包文件]",
+		"net.err.no_input":              "没有可用的输入抓包（路径不存在，或目录里没有抓包文件）",
+		"net.err.bad_top":               "--top 必须大于 0: %d",
+		"net.err.bad_limit":             "-n/--limit 不能为负数: %d",
+		"net.err.open":                  "无法读取 %s: %v",
+		"net.err.unrecognized":          "%s 不是受支持的抓包容器（仅支持 pcap/pcapng）",
+		"net.err.bad_capture":           "解析抓包失败: %v",
+		"net.err.create_out":            "创建报告文件失败: %v",
+		"net.err.filter_missing":        "过滤表达式不完整，%s 后面缺少参数",
+		"net.err.filter_ip":             "无法识别的 IP 地址: %s",
+		"net.err.filter_port":           "无法识别的端口号: %s",
+		"net.err.filter_token":          "无法识别的过滤条件: %s",
+		"net.err.filter_dir":            "%s 只能与 host 或 port 连用",
+		"net.err.filter_unknown_field":  "未知字段: %s（输入 \x1b[5m?\x1b[0m 查看可用字段）",
+		"net.err.filter_char":           "过滤表达式含非法字符: %s",
+		"net.err.filter_unterminated":   "过滤表达式里的字符串没有闭合引号",
+		"net.err.filter_unclosed_paren": "过滤表达式括号未闭合",
+		"net.err.filter_number":         "不是合法的数字: %s",
+		"net.err.filter_empty":          "过滤表达式为空",
+		"net.err.bad_model":             "无法识别的分析模型: %s（可用: %s）",
+
+		// ---- net 提示 ----
+		"net.info.saved": "报告已写入 %s",
+
+		// ---- net 概览 ----
+		"net.label.format":          "格式",
+		"net.label.linktype":        "链路类型",
+		"net.label.filter":          "过滤条件",
+		"net.label.packets":         "数据包",
+		"net.label.time":            "时间范围",
+		"net.label.bytes":           "流量",
+		"net.label.models":          "分析模型",
+		"net.label.peak":            "峰值速率",
+		"net.packets.filtered":      "%d（过滤后 %d）",
+		"net.time.desc":             "%s → %s（%s）",
+		"net.bytes.desc":            "抓取 %s，线上 %s",
+		"net.endian.le":             "小端",
+		"net.endian.be":             "大端",
+		"net.ts.sec":                "秒时间戳",
+		"net.ts.msec":               "毫秒时间戳",
+		"net.ts.usec":               "微秒时间戳",
+		"net.ts.nsec":               "纳秒时间戳",
+		"net.format.ifaces":         "%d 个接口",
+		"net.link.unknown":          "未知链路类型 (DLT %d)",
+		"net.warn.unsupported_link": "不支持的链路类型 %d，跳过 %d 帧",
+		"net.report.no_match":       "没有匹配过滤条件的数据包",
+
+		// ---- net 段落与表头 ----
+		"net.section.protocols": "协议分布",
+		"net.section.flows":     "会话 TOP %d",
+		"net.section.endpoints": "主机 TOP %d",
+		"net.section.ports":     "端口 TOP %d",
+		"net.section.dns":       "DNS 查询",
+		"net.section.sni":       "TLS SNI",
+		"net.section.http":      "HTTP",
+		"net.section.findings":  "安全发现",
+		"net.section.attack":    "攻击分析",
+		"net.layer.l2":          "链路层",
+		"net.layer.l3":          "网络层",
+		"net.layer.l4":          "传输层",
+		"net.layer.l7":          "应用层",
+		"net.subsection.hosts":  "主机",
+		"net.subsection.uris":   "请求 URI",
+		"net.head.layer":        "层级",
+		"net.head.proto":        "协议",
+		"net.head.packets":      "包数",
+		"net.head.percent":      "占比",
+		"net.head.bytes":        "字节",
+		"net.head.rank":         "序",
+		"net.head.flow":         "会话",
+		"net.head.host":         "主机",
+		"net.head.ip":           "IP",
+		"net.head.mac":          "MAC",
+		"net.head.sent":         "发包",
+		"net.head.recv":         "收包",
+		"net.head.port":         "端口",
+		"net.head.service":      "服务",
+		"net.head.name":         "名称",
+		"net.head.count":        "次数",
+		"net.head.uri":          "URI",
+		"net.head.idx":          "#",
+		"net.head.time":         "时间",
+		"net.head.endpoints":    "端点",
+		"net.head.len":          "长度",
+		"net.head.info":         "信息",
+		"net.head.model":        "模型",
+		"net.head.verdict":      "判定",
+		"net.head.metrics":      "关键指标",
+
+		// ---- net 统计口径 ----
+		"net.proto.unidentified": "未识别",
+		"net.proto.other":        "其它",
+		"net.service.unknown":    "未登记",
+		"net.packets_fmt":        "%d 包",
+		"net.dns.summary":        "查询 %d 条，唯一域名 %d 个，失败响应 %d 条",
+		"net.http.summary":       "明文 HTTP 请求 %d 条",
+		"net.list.summary":       "共 %d 个包，匹配 %d 个，已列出 %d 个",
+
+		// ---- net 逐包摘要 ----
+		"net.info.beacon":       "信标（SSID: %s）",
+		"net.info.probe_req":    "探测请求（SSID: %s）",
+		"net.info.arp_req":      "谁是 %s？告诉 %s",
+		"net.info.arp_rep":      "%s 的 MAC 是 %s",
+		"net.info.echo_req":     "Echo 请求 id=%d seq=%d",
+		"net.info.echo_rep":     "Echo 响应 id=%d seq=%d",
+		"net.info.icmp_unreach": "目标不可达 (code=%d)",
+		"net.info.icmp_ttl":     "传输超时 (code=%d)",
+		"net.info.icmp":         "type=%d code=%d",
+		"net.info.nd_ns":        "邻居请求 %s",
+		"net.info.nd_na":        "邻居通告 %s",
+		"net.info.nd_rs":        "路由请求",
+		"net.info.nd_ra":        "路由通告",
+		"net.info.ipv4_frag":    "IPv4 分片 offset=%d",
+		"net.info.ipv6_frag":    "IPv6 分片 offset=%d",
+
+		// ---- net 攻击分析 ----
+		"net.verdict.hit":       "命中",
+		"net.verdict.suspect":   "疑似",
+		"net.verdict.miss":      "未命中",
+		"net.model.syn":         "SYN 洪泛",
+		"net.model.udp":         "UDP 洪泛",
+		"net.model.icmp":        "ICMP 洪泛",
+		"net.model.cc":          "CC 攻击",
+		"net.model.loss":        "流量丢包/传输异常",
+		"net.model.frag":        "IP 分片异常",
+		"net.metric.syn":        "SYN %d（峰值 %d/s），SYN-ACK %d，源 IP %d 个，占 TCP %s",
+		"net.metric.udp":        "UDP %d 包（峰值 %d/s），占总包 %s",
+		"net.metric.icmp":       "ICMP %d 包（峰值 %d/s），占总包 %s",
+		"net.metric.cc":         "HTTP 请求 %d 条（峰值 %d/s），Top 源 %s %d 次，Top URI %s %d 次",
+		"net.metric.loss":       "重传 %d（占数据段 %s），重复 ACK %d，seq 间隙 %d，零窗口 %d，截断 %d",
+		"net.metric.frag":       "分片 %d 片，重叠 %d，畸形 %d",
+		"net.attack.syn":        "SYN 洪泛迹象: SYN %d、SYN-ACK %d，峰值 %d/s，SYN 占 TCP %s",
+		"net.attack.random_src": "源 IP 随机化/伪造: 仅出现 1 次且只发 SYN 的源 %d 个（共 %d 个 SYN 源，占 %s）",
+		"net.attack.udp":        "UDP 洪泛迹象: 峰值 %d/s，占总包 %s",
+		"net.attack.icmp":       "ICMP 洪泛迹象: 峰值 %d/s，占总包 %s",
+		"net.attack.cc":         "CC 攻击迹象: HTTP 请求 %d 条，峰值 %d/s，Top 源 %s（%d 次），Top URI %s（%d 次）",
+		"net.attack.cc_dist":    "分布式 CC: 同一 URI %s 被 %d 个不同源请求，共 %d 次",
+		"net.attack.cc_single":  "单源高频请求: %s 共 %d 次，占全部请求 %s",
+		"net.attack.loss":       "TCP 传输异常: 重传 %d（占数据段 %s），重复 ACK %d，seq 间隙 %d，零窗口 %d",
+		"net.attack.trunc":      "抓包被截断: %d 个包的捕获长度小于线上长度，统计不完整",
+		"net.attack.frag":       "分片异常: 重叠 %d 片、畸形 %d 片（泪滴类攻击特征）",
+		"net.attack.capped":     "统计键数达到上限 %d，部分指标不完整",
+
+		// ---- net 逐包详细视图（-V）----
+		"net.flag.verbose":       "逐包详细视图，按 tshark -V 的协议树列出每个字段（自动开启 -l）",
+		"net.det.frame_hdr":      "第 %d 帧: 线上 %d 字节 (%d 比特)，已捕获 %d 字节 (%d 比特)",
+		"net.det.encap":          "封装类型",
+		"net.det.arrival":        "到达时间",
+		"net.det.epoch":          "时间戳",
+		"net.det.since_ref":      "相对首帧",
+		"net.det.seconds":        "秒",
+		"net.det.frame_no":       "帧号",
+		"net.det.frame_len":      "帧长度",
+		"net.det.cap_len":        "捕获长度",
+		"net.det.truncated":      "抓包被截断",
+		"net.det.protocols":      "协议栈",
+		"net.det.yes":            "是",
+		"net.det.none":           "无",
+		"net.det.set":            "置位",
+		"net.det.notset":         "未置位",
+		"net.det.info":           "摘要",
+		"net.det.eth_hdr":        "以太网 II, 源: %s, 目的: %s",
+		"net.det.dst":            "目的地址",
+		"net.det.src":            "源地址",
+		"net.det.vlan_idx":       "VLAN %d ID",
+		"net.det.type":           "类型",
+		"net.det.etype":          "%s (0x%04x)",
+		"net.det.ipv4_hdr":       "IPv4, 源: %s, 目的: %s",
+		"net.det.ipv6_hdr":       "IPv6, 源: %s, 目的: %s",
+		"net.det.version":        "版本",
+		"net.det.hdr_len":        "头部长度",
+		"net.det.bytes":          "%d 字节 (%d)",
+		"net.det.bytes_bits":     "%d 字节 (%d 比特)",
+		"net.det.dsfield":        "区分服务字段",
+		"net.det.total_len":      "总长度",
+		"net.det.ident":          "标识",
+		"net.det.flags":          "标志位",
+		"net.det.df":             "不分片 (DF)",
+		"net.det.mf":             "更多分片 (MF)",
+		"net.det.frag_off":       "分片偏移",
+		"net.det.frag_off_val":   "%d (%d 字节)",
+		"net.det.ttl":            "生存时间",
+		"net.det.hop_limit":      "跳数限制",
+		"net.det.protocol":       "协议",
+		"net.det.next_hdr":       "下一头部",
+		"net.det.hdr_cksum":      "头部校验和",
+		"net.det.src_addr":       "源地址",
+		"net.det.dst_addr":       "目的地址",
+		"net.det.tclass":         "流量类别",
+		"net.det.flow_label":     "流标签",
+		"net.det.payload_len":    "载荷长度",
+		"net.det.tcp_hdr":        "TCP, 源端口: %d, 目的端口: %d, 序号: %d, 确认号: %d, 载荷: %d 字节",
+		"net.det.udp_hdr":        "UDP, 源端口: %d, 目的端口: %d, 载荷: %d 字节",
+		"net.det.icmp_hdr":       "%s, 类型: %d, 代码: %d",
+		"net.det.icmp_type":      "%s (%d)",
+		"net.det.src_port":       "源端口",
+		"net.det.dst_port":       "目的端口",
+		"net.det.seq":            "序号",
+		"net.det.ack":            "确认号",
+		"net.det.tcp_flags":      "标志位",
+		"net.det.window":         "窗口大小",
+		"net.det.checksum":       "校验和",
+		"net.det.urgent_ptr":     "紧急指针",
+		"net.det.length":         "长度",
+		"net.det.service":        "服务",
+		"net.det.code":           "代码",
+		"net.det.icmp_id":        "标识符",
+		"net.det.icmp_seq":       "序列号",
+		"net.det.options":        "选项",
+		"net.det.opt_kind":       "选项类型: %s",
+		"net.det.flag.cwr":       "CWR",
+		"net.det.flag.ece":       "ECE",
+		"net.det.flag.urg":       "URG",
+		"net.det.flag.ack":       "ACK",
+		"net.det.flag.psh":       "PSH",
+		"net.det.flag.rst":       "RST",
+		"net.det.flag.syn":       "SYN",
+		"net.det.flag.fin":       "FIN",
+		"net.det.arp_hdr":        "ARP: %s",
+		"net.det.hw_type":        "硬件类型",
+		"net.det.proto_type":     "协议类型",
+		"net.det.hw_size":        "硬件地址长度",
+		"net.det.proto_size":     "协议地址长度",
+		"net.det.arp_op":         "操作码",
+		"net.det.arp_request":    "请求 (1)",
+		"net.det.arp_reply":      "应答 (2)",
+		"net.det.arp_other":      "其它",
+		"net.det.arp_sender_mac": "发送方 MAC",
+		"net.det.arp_sender_ip":  "发送方 IP",
+		"net.det.arp_target_mac": "目标 MAC",
+		"net.det.arp_target_ip":  "目标 IP",
+		"net.det.http_host":      "Host",
+		"net.det.http_cred":      "认证凭据",
+		"net.det.http_pass":      "明文口令字段",
+		"net.det.dns_name":       "查询名",
+		"net.det.dns_ans":        "应答",
+		"net.det.tls_sni":        "SNI",
+		"net.det.frame_data":     "帧数据",
+
+		// ---- net 交互式 TUI（-T） ----
+		"net.flag.tui":                "交互式抓包浏览器：全屏包列表 + 协议树详情，可滚动/选中/实时过滤（需终端）",
+		"net.tui.no":                  "编号",
+		"net.tui.source":              "源",
+		"net.tui.dest":                "目的",
+		"net.tui.proto":               "协议",
+		"net.tui.length":              "长度",
+		"net.tui.info":                "信息",
+		"net.tui.detail":              "协议树详情",
+		"net.tui.detail_sel":          "（第 %d 帧，共 %d 个可见）",
+		"net.tui.packets":             "个包",
+		"net.tui.no_filter":           "（无过滤）",
+		"net.tui.filter_prompt":       "过滤> ",
+		"net.tui.filter_canceled":     "已取消过滤编辑",
+		"net.tui.filter_cleared":      "已清除过滤条件",
+		"net.tui.filter_hint_empty":   "直接回车清除过滤；输入表达式可过滤",
+		"net.tui.filter_hint_ok":      "语法正确，回车应用",
+		"net.tui.filter_ex_empty":     "例：tcp.port == 443 · ip.addr == 10.0.0.1 · frame.len > 1000 · http.host contains \"x\" · !(arp)",
+		"net.tui.filter_ex_port":      "端口：tcp.port == 443 · src port 1024 · udp.port != 53",
+		"net.tui.filter_ex_ip":        "地址：ip.addr == 10.0.0.1 · src host 192.168.1.1 · ip.dst != 8.8.8.8",
+		"net.tui.filter_ex_len":       "长度：frame.len > 1000 · frame.len <= 1500 · tcp.payload_len >= 100",
+		"net.tui.filter_ex_generic":   "例：tcp · tcp && port == 443 · (tcp || udp) && !arp · dns.qry.name contains \"example\"",
+		"net.tui.filter_ex_ipfield":   "%s 接受 IP：%s == 10.0.0.1（或用 src host 10.0.0.1）",
+		"net.tui.filter_ex_intfield":  "%s 接受数字：%s == 443 · %s > 100 · %s != 0",
+		"net.tui.filter_ex_strfield":  "%s 接受字符串：%s contains \"x\" · %s == \"abc\"",
+		"net.tui.filter_ex_boolfield": "%s 是布尔量：%s == 1（置位）或 == 0（未置位）",
+		"net.tui.sug_none":            "提示：字段名 + 运算符 + 值，例如 tcp.port == 443；Tab 接受补全，? 查看全部字段",
+		"net.tui.sug_field":           "字段：",
+		"net.tui.sug_field_prefix":    "补全「%s」：",
+		"net.tui.sug_no_field":        "没有以 %s 开头的字段，按 ? 查看全部可用字段",
+		"net.tui.sug_operator":        "%s 可用运算符：%s",
+		"net.tui.sug_value_generic":   "运算符后填写对应的值",
+		"net.tui.sug_val_ip":          "%s 需要 IP 地址，例如 %s == 10.0.0.1",
+		"net.tui.sug_val_int":         "%s 需要数字，例如 %s == 443，或 %s > 100",
+		"net.tui.sug_val_str":         "%s 需要字符串（加引号），例如 %s contains \"x\"",
+		"net.tui.sug_val_bool":        "%s 是布尔量，写 %s == 1 或 %s == 0",
+		"net.tui.sug_val_float":       "%s 需要数字，例如 %s > 1.5",
+		"net.tui.sug_logic":           "条件已完整，可继续写 && 或 || 串联，或直接回车应用",
+		"net.tui.sug_tab":             "   （Tab 接受）",
+		"net.tui.empty":               "过滤后没有匹配的包",
+		"net.tui.no_match":            "没有匹配的包，按 c 清除过滤或 r 重新应用",
+		"net.tui.key_move":            "移动",
+		"net.tui.key_pane":            "面板",
+		"net.tui.key_fold":            "折叠",
+		"net.tui.key_filter":          "过滤",
+		"net.tui.key_stats":           "统计",
+		"net.tui.key_bytes":           "字节",
+		"net.tui.key_help":            "帮助",
+		"net.tui.key_quit":            "退出",
+		"net.tui.key_enter":           "展开",
+		"net.tui.key_fold_all":        "全部折叠",
+		"net.tui.key_scroll":          "滚动",
+		"net.tui.help_title":          "快捷键",
+		"net.tui.help_move":           "上下移动选中包",
+		"net.tui.help_fold":           "折叠 / 展开当前节点",
+		"net.tui.help_fold_all":       "全部折叠 / 全部展开",
+		"net.tui.help_pane":           "在包列表、协议树、字节面板间切换焦点",
+		"net.tui.help_enter":          "展开或收起详情面板",
+		"net.tui.help_filter":         "打开过滤输入（显示过滤器语法，如 tcp.port == 443）",
+		"net.tui.help_history":        "过滤输入时翻阅历史表达式",
+		"net.tui.help_esc":            "取消编辑；已有过滤时再按一次清除过滤",
+		"net.tui.help_help":           "打开 / 关闭本帮助",
+		"net.tui.help_stats":          "统计面板（协议 / 端点 / 会话分布）",
+		"net.tui.help_clear":          "清除过滤，显示全部包",
+		"net.tui.help_reapply":        "重新应用当前过滤",
+		"net.tui.help_jump":           "跳到首包 / 末包",
+		"net.tui.help_page":           "上下翻页",
+		"net.tui.help_quit":           "退出",
+		"net.tui.help_filter_fields":  "过滤可用字段：",
+		"net.tui.filter_help":         "可用过滤字段",
+		"net.tui.filter_help_hint":    "比如 ip.addr == 10.0.0.1 && tcp.port == 443；↑/↓ 调历史，Esc 取消，?q 退出本帮助",
+		"net.tui.time":                "时间",
+		"net.tui.bytes":               "字节",
+		"net.tui.tree":                "协议树",
+		"net.tui.stats":               "统计",
+		"net.tui.pane_list":           "包列表",
+		"net.tui.focus":               "当前面板",
+		"net.tui.stat_proto":          "协议分布",
+		"net.tui.stat_endpoint":       "端点分布",
+		"net.tui.stat_convers":        "会话分布",
+		"net.tui.stat_calculating":    "正在统计…",
+		"net.tui.stat_none":           "没有可统计的数据",
+		"net.tui.collapse_all":        "已全部折叠",
+		"net.tui.expand_all":          "已全部展开",
+		"net.tui.no_bytes":            "该帧没有原始字节",
+		"net.tui.name":                "名称",
+		"net.tui.stat_summary":        "共 %d 个包 / %s",
+		"net.tui.percent":             "占比",
+		"net.err.no_tty":              "交互式模式需要终端（stdin/stdout 均为 TTY）；请改用 -l 或 -V",
+		"net.err.tui_output":          "-T 交互式模式占用终端，不能与 -o 同时使用",
+		"net.err.frame_range":         "帧下标越界：%d",
+
+		// ---- net 安全发现 ----
+		"net.find.none":      "未发现明显的安全问题",
+		"net.find.cred":      "捕获到明文凭据: %s",
+		"net.find.field":     "HTTP 请求中的明文口令字段: %s",
+		"net.find.arp":       "同一 IP 出现在多个 MAC 上，疑似 ARP 欺骗",
+		"net.find.cleartext": "存在未加密的明文协议流量",
+
+		// ==================== mem 模块 ====================
+		"mem.group":   "内存取证",
+		"mem.summary": "内存取证：分析活体进程或内存转储，还原程序行为并从内存中恢复文件",
+
+		"mem.flag.input":    "分析目标：进程 PID、self（当前进程）或内存转储文件路径",
+		"mem.flag.action":   "要执行的动作，逗号分隔可重复（info/maps/strings/behavior/carve/hash/entropy/dump/all）",
+		"mem.flag.carvedir": "把恢复出来的文件写入该目录",
+		"mem.flag.type":     "雕取的文件类型，逗号分隔（all 默认，或 png/jpg/zip/pdf/pe/sqlite…）",
+		"mem.flag.filter":   "只保留包含该关键字（忽略大小写）的字符串与行为痕迹",
+		"mem.flag.region":   "只分析指定区域：类型（image/heap/stack/mapped/anon）、all 或地址范围 0x1000-0x2000",
+		"mem.flag.minsize":  "跳过小于该字节数的区域",
+		"mem.flag.maxsize":  "跳过大于该字节数的区域（0 表示不限）",
+		"mem.flag.minlen":   "字符串最小长度（默认 4）",
+		"mem.flag.limit":    "每类结果最多输出多少条（默认 50）",
+		"mem.flag.encoding": "字符串编码：ascii / utf16 / both（默认 both）",
+		"mem.flag.addr":     "写入目标地址：0x1234、十进制，或 区域名+偏移（如 heap+0x40）",
+		"mem.flag.data":     "要写入/替换的内容：\\xNN 字节序列、@文件路径，或普通 UTF-8 原文",
+		"mem.flag.apply":    "真正执行写入；不加时只预览改动，不碰目标",
+		"mem.flag.force":    "允许写入没有写权限的区域/目标（默认拒绝）",
+		"mem.flag.backup":   "回滚记录文件路径（写入时自动生成备份，可用 -a restore 回滚）",
+		"mem.flag.max":      "一次最多改写多少处（patch 时默认不限）",
+		"mem.flag.out":      "把报告写入该文件（默认打印到 stdout）",
+		"mem.flag.dump":     "把内存镜像导出到该文件（等价于 -a dump）",
+		"mem.flag.json":     "输出 JSON 而非人读报告，便于 jq 等工具二次处理",
+		"mem.flag.verbose":  "详细模式：列出全部区域（含未选中的）与已加载模块",
+		"mem.flag.quiet":    "静默模式，不向 stderr 输出逐区域进度",
+		"mem.flag.nonascii": "保留非 ASCII 字符串",
+		"mem.flag.showall":  "不限制结果条数（输出可能很长）",
+
+		"mem.usage": `gyhost mem - 内存取证：分析活体进程或内存转储文件
+
+用法:
+  gyhost mem -i <pid|self|转储文件> [-a 动作] [选项...]
+
+参数（三个平台完全一致；底层按 Windows / Linux / macOS 分别编译）:
+
+  -i, -input     分析目标
+                    <pid>       正在运行的进程
+                    self        当前进程
+                    <文件路径>   内存转储文件（raw/dmp/bin，任意平台都能分析）
+  -e, -program   分析指定程序，直接给 PID 或程序名，不用先查 PID
+                  程序名匹配进程名 / 可执行文件名 / 命令行，命中多个则依次分析
+  -l, -list      列出程序与子线程（值可省略）
+                  -l            列出全部程序，并显示每个程序的子线程
+                  -l <PID|程序名> 只显示该程序的子线程
+  -a, -action    执行动作，逗号分隔可重复（默认 info,behavior）
+  -o, -out       报告写入文件，stdout 保持干净
+  -q, -quiet     不向 stderr 输出逐区域进度
+
+  收敛分析范围
+  -r, -region    只分析指定区域：image / heap / stack / mapped / anon
+                  或地址范围，如 -r 0x7f0000000000-0x7f0000100000
+  -s, -minsize   跳过小于该字节数的区域
+  -S, -maxsize   跳过大于该字节数的区域
+  -k, -filter    只保留包含该关键字的字符串与行为痕迹
+  -L, -minlen    字符串最小长度
+  -E, -encoding  字符串编码：ascii / utf16 / both
+  -n, -limit     每类结果最多输出条数（默认 50）
+  -X, -showall   不限制条数
+
+  输出形式
+  -j, -json      JSON 结构化输出，便于 jq 等工具处理
+  -V, -verbose   详细模式（列出全部区域与已加载模块）
+
+  内存中恢复文件
+  -c, -carvedir  把恢复出来的文件写入该目录
+  -t, -type      只雕取指定类型，逗号分隔（all 为全部）
+
+  导出内存镜像
+  -d, -dump      把内存镜像导出为 raw dump（同时生成 .index 索引）
+
+在内存中操作目标程序（改写行为）
+  -a write       在 --addr 指定的地址原位写入 -Y 的内容
+  -a patch       把内存里 -k 指定的内容替换成 -Y 指定的内容
+  -a restore     按备份记录回滚，把内存改回补丁前的样子
+  --addr ADDR    目标地址：0x1234、十进制，或 区域名+偏移（如 heap+0x40）
+  -Y DATA        写入/替换内容：\xNN 字节序列、@文件路径，或普通 UTF-8 原文
+  --apply        真正执行写入（默认只预览，不碰目标）
+  --force        允许写入无写权限的区域/目标（默认拒绝）
+  --backup FILE  回滚记录文件（写入时自动生成，-a restore 时读取）
+  --max N        一次最多改写多少处
+
+动作 (-a):
+  info      目标概览：进程信息、区域统计、类型分布、整体摘要
+  maps      内存区域列表（地址、权限、类型、宿主文件）
+  strings   字符串提取（ASCII 与 UTF-16LE）
+  behavior  程序行为分析：URL/IP/域名/凭据/命令行/注入与持久化痕迹
+  carve     从内存中恢复文件（按魔数雕取）
+  hash      区域哈希（md5 / sha256）
+  entropy   区域熵（判断明文 / 压缩 / 加密数据）
+  dump      导出内存镜像为 raw dump
+  write     在内存中按地址写入（需 --addr + -Y + --apply）
+  patch     在内存中搜索替换（需 -k + -Y + --apply）
+  restore   回滚到补丁前的原始内容（需 --backup + --apply）
+  all       以上除 dump / write / patch / restore 外的全部
+            （写类动作必须显式点名，不会被 all 顺带触发）
+
+支持雕取的文件类型:
+  png jpg gif pdf zip gzip bmp elf sqlite 7z rar dex tiff wav pe class lnk
+  （-t 传 all 表示不限类型）
+
+行为痕迹分类 (-a behavior):
+  网络    url ip domain email port
+  凭据    password private_key aws_key jwt basic_auth shadow
+  主机    path_unix path_win registry env command
+  取证    injection cred_dump persist anti_forensic mining ransom
+
+示例:
+  gyhost mem -l                                       # 列出全部程序与它们的子线程
+  gyhost mem -l nginx                                 # 只看 nginx 这个程序的子线程
+  gyhost mem -l 1234                                  # 只看 pid 1234 的子线程
+  gyhost mem -e nginx                                 # 按程序名分析（等价于 -i <pid>）
+  gyhost mem -e nginx -a info,behavior                # 按程序名做概览与行为分析
+  gyhost mem -i self                                  # 分析当前进程
+  gyhost mem -i 1234 -a info,maps                     # 看某进程的内存布局
+  gyhost mem -i 1234 -a behavior -s 1048576           # 行为分析，跳过 1MB 以下区域
+  gyhost mem -i 1234 -a carve -c ./carved -t png,zip  # 从内存里恢复 png/zip
+  gyhost mem -i memdump.raw -a all -o report.txt      # 离线分析转储并写文件
+  gyhost mem -i memdump.raw -a strings -k password    # 只看含 password 的串
+  gyhost mem -i 1234 -a dump -d target.memdump        # 导出内存留证
+  gyhost mem -i 1234 -a patch -k production -Y staging # 预览：把 production 改成 staging
+  gyhost mem -i 1234 -a patch -k production -Y staging --apply   # 真的改写内存
+  gyhost mem -i mem.bin -a write --addr heap+0x40 -Y '\x00\x01' --apply
+  gyhost mem -i 1234 -a restore --backup mem-nginx-*.bak --apply  # 回滚
+  gyhost mem -i memdump.raw -a info -j | jq .summary # JSON 接管道
+  gyhost help mem`,
+
+		// ---- mem 提示 ----
+		"mem.info.opening":  "正在打开目标: %s",
+		"mem.info.region":   "已扫描区域 %s  (%s)",
+		"mem.info.selected": "%d 个（跳过 %d 个）",
+		"mem.info.scanned":  "%s，完整 %d 个 / 中断 %d 个",
+		"mem.info.saved":    "报告已写入: %s",
+		"mem.info.dumped":   "内存镜像已导出: %s（%s，%d 个区域）",
+		"mem.dump.summary":  "已导出 %d 个区域共 %s 到: %s",
+		"mem.dump.index":    "区域索引: %s",
+
+		// ---- mem 错误 ----
+		"mem.err.missing_input": "缺少必需参数: -i <pid|self|转储文件>",
+		"mem.err.bad_action":    "未知的 -a 动作: %s（可用: info/maps/strings/behavior/carve/hash/entropy/dump/all）",
+		"mem.err.bad_target":    "无法识别的 -i 目标: %s",
+		"mem.err.bad_region":    "无法识别的 -r 区域过滤: %s（可用: all/image/heap/stack/mapped/anon 或地址范围）",
+		"mem.err.bad_minsize":   "-s 区域大小下限必须 >= 0（当前 %d）",
+		"mem.err.bad_maxsize":   "-S 区域大小上限必须 >= 0（当前 %d）",
+		"mem.err.bad_minlen":    "-L 字符串最小长度必须在 1~4096 之间（当前 %d）",
+		"mem.err.bad_limit":     "-n 条数上限必须 >= 0（当前 %d）",
+		"mem.err.size_range":    "-s(%d) 不能大于 -S(%d)",
+		"mem.err.bad_encoding":  "未知的 -e 编码: %s（可用: ascii/utf16/both）",
+		"mem.err.json_carve":    "-j 与 -c 不能同时使用（JSON 面向管道，恢复文件请用 -c 单独跑）",
+		"mem.err.privilege":     "权限不足，无法读取 %s 上的目标进程内存: %s",
+		"mem.err.unsupported":   "当前平台 (%s) 未实现活体内存读取；仍可用 -i <转储文件> 分析内存镜像",
+		"mem.err.no_process":    "目标进程不存在: %s",
+		"mem.err.gone":          "目标进程已退出或内存不可读: %s（%v）",
+		"mem.err.open_target":   "打开目标失败: %s（%v）",
+		"mem.err.open_file":     "打开内存转储文件失败: %s（%v）",
+		"mem.err.regions":       "读取内存区域列表失败: %v",
+		"mem.err.no_regions":    "目标没有任何可读内存区域",
+		"mem.err.no_selected":   "过滤后没有可分析的区域，请放宽 -r / -s / -S",
+		"mem.err.create_out":    "创建输出文件失败: %v",
+		"mem.err.write_out":     "写入输出文件失败: %v",
+		"mem.err.create_dir":    "创建恢复目录失败: %s（%v）",
+		"mem.err.write_file":    "写入恢复文件失败: %s（%v）",
+
+		// ---- mem 报告 ----
+		"mem.sec.overview": "目标概览",
+		"mem.sec.maps":     "内存区域",
+		"mem.sec.entropy":  "区域熵",
+		"mem.sec.hash":     "区域哈希",
+		"mem.sec.behavior": "程序行为痕迹",
+		"mem.sec.strings":  "字符串",
+		"mem.sec.carve":    "内存中恢复的文件",
+
+		"mem.kind.live":          "活体进程",
+		"mem.kind.file":          "内存转储文件",
+		"mem.kind.url":           "URL",
+		"mem.kind.ip":            "IPv4 地址",
+		"mem.kind.domain":        "域名",
+		"mem.kind.email":         "邮箱",
+		"mem.kind.port":          "端口",
+		"mem.kind.password":      "口令/凭据",
+		"mem.kind.private_key":   "私钥材料",
+		"mem.kind.aws_key":       "云访问密钥",
+		"mem.kind.jwt":           "JWT 令牌",
+		"mem.kind.basic_auth":    "HTTP Basic 认证头",
+		"mem.kind.shadow":        "shadow 口令行",
+		"mem.kind.path_unix":     "Unix 路径",
+		"mem.kind.path_win":      "Windows 路径",
+		"mem.kind.registry":      "注册表键",
+		"mem.kind.env":           "环境变量",
+		"mem.kind.command":       "命令行",
+		"mem.kind.injection":     "进程注入 API",
+		"mem.kind.cred_dump":     "凭据窃取痕迹",
+		"mem.kind.persist":       "持久化痕迹",
+		"mem.kind.anti_forensic": "反取证痕迹",
+		"mem.kind.mining":        "挖矿痕迹",
+		"mem.kind.ransom":        "勒索痕迹",
+
+		"mem.col.kind":     "目标类型",
+		"mem.col.target":   "目标",
+		"mem.col.pid":      "进程",
+		"mem.col.ppid":     "父进程",
+		"mem.col.proc":     "进程名",
+		"mem.col.exe":      "可执行文件",
+		"mem.col.arch":     "架构",
+		"mem.col.user":     "用户",
+		"mem.col.started":  "启动时间",
+		"mem.col.vsize":    "虚拟内存",
+		"mem.col.regions":  "内存区域",
+		"mem.col.selected": "参与分析",
+		"mem.col.exec":     "可执行区",
+		"mem.col.scanned":  "已读取",
+		"mem.col.total":    "整体摘要",
+		"mem.col.start":    "起始地址",
+		"mem.col.end":      "结束地址",
+		"mem.col.size":     "大小",
+		"mem.col.perm":     "权限",
+		"mem.col.path":     "宿主文件",
+		"mem.col.entropy":  "熵",
+		"mem.col.class":    "分类",
+		"mem.col.risk":     "风险",
+		"mem.col.offset":   "偏移",
+		"mem.col.value":    "内容",
+		"mem.col.enc":      "编码",
+		"mem.col.type":     "类型",
+		"mem.col.score":    "置信度",
+		"mem.col.saved":    "已保存",
+
+		"mem.bykind":                   "按区域类型分布:",
+		"mem.modules":                  "已加载模块（%d 个）:",
+		"mem.more":                     "还有 %d 条未显示（用 -n 调整或 -X 显示全部）",
+		"mem.none":                     "（无）",
+		"mem.maps.header":              "%-16s %-16s %10s  %-4s %-6s %s",
+		"mem.entropy.header":           "%8s %-7s %10s  %-6s %s",
+		"mem.hash.header":              "%-16s %10s  %-6s %-32s %s",
+		"mem.behavior.header":          "%-6s %-12s %-16s  %s",
+		"mem.behavior.stats":           "分类统计:",
+		"mem.behavior.count":           "个",
+		"mem.behavior.none":            "未发现明显的行为痕迹",
+		"mem.strings.header":           "%-16s  %-7s  %s",
+		"mem.strings.none":             "没有提取到字符串",
+		"mem.carve.header":             "%-8s %-16s %10s  %3s %-64s %s",
+		"mem.carve.none":               "没有雕取到文件",
+		"mem.carve.saved":              "已保存 %d 个文件到: %s",
+		"mem.risk.0":                   "无害",
+		"mem.risk.1":                   "信息",
+		"mem.risk.2":                   "可疑",
+		"mem.risk.3":                   "高危",
+		"mem.sec.patch":                "内存改写",
+		"mem.col.op":                   "动作",
+		"mem.col.mode":                 "模式",
+		"mem.col.hits":                 "命中",
+		"mem.col.skipped":              "被拒",
+		"mem.col.written":              "已写入",
+		"mem.col.addr":                 "地址",
+		"mem.col.before":               "改前",
+		"mem.col.after":                "改后",
+		"mem.col.status":               "状态",
+		"mem.patch.header":             "%-16s  %-22s -> %-22s %s",
+		"mem.patch.preview":            "预览（未写入）",
+		"mem.patch.applied":            "已执行",
+		"mem.patch.ok":                 "OK",
+		"mem.patch.none":               "没有匹配到要改写的内容",
+		"mem.patch.hint":               "以上仅为预览；确认无误后加 --apply 才会真正写入目标内存",
+		"mem.info.backup_saved":        "已保存回滚记录（%d 条）: %s",
+		"mem.warn.backup_failed":       "回滚记录保存失败: %s（%v）",
+		"mem.warn.bad_record":          "地址 %#x 的备份记录无法解析，已跳过: %v",
+		"mem.warn.restore_unreadable":  "地址 %#x 已不可读，无法回滚",
+		"mem.warn.restore_failed":      "地址 %#x 回滚失败: %v",
+		"mem.err.not_writable":         "目标不可写（%s 平台）：没有写权限；请用 root/管理员重试，或先 -d 导出后在镜像上操作",
+		"mem.err.write_need_target":    "write/patch/restore 需要指定目标: -i <pid|self|转储文件> 或 -e <程序>",
+		"mem.err.write_need_addr":      "-a write 需要 --addr 指定目标地址",
+		"mem.err.write_need_data":      "需要用 -Y 指定要写入的内容",
+		"mem.err.patch_need_data":      "需要用 -Y 指定替换成的内容",
+		"mem.err.patch_need_needle":    "需要用 -k 指定要查找的内容（原始字节或原文）",
+		"mem.err.bad_data":             "无法解析 -Y 的内容: %v",
+		"mem.err.bad_addr":             "无法解析 --addr: %s",
+		"mem.err.no_such_region":       "没有类型为 %s 的区域（用 -a maps 看有哪些）",
+		"mem.err.addr_out_of_region":   "偏移 %#x 超出 %s 区域范围（%s）",
+		"mem.err.bad_max":              "--max 必须 >= 0（当前 %d）",
+		"mem.err.restore_need_backup":  "-a restore 需要 --backup <回滚记录文件>",
+		"mem.err.no_backup":            "回滚记录文件里没有任何记录",
+		"mem.err.restore_preview_only": "回滚只做了预览；加 --apply 才会真正写回",
+		"mem.err.no_write_action":      "未指定写类动作（write / patch / restore）",
+		"mem.err.target_conflict":      "-i 与 -e 不能同时使用（两个都指定了分析目标）",
+		"mem.err.no_match":             "没有匹配的程序: %s（可用 -l 先查看程序列表）",
+		"mem.err.list_processes":       "枚举 %s 上的进程失败: %v",
+		"mem.err.threads_unsupported":  "当前平台 (%s) 无法枚举线程",
+		"mem.info.matched":             "命中程序: pid %d (%s)",
+		"mem.info.self_target":         "self (pid %d, %s)",
+		"mem.info.proc_target":         "%s (pid %d)",
+		"mem.info.multi_match":         "%s 匹配到 %d 个进程，将依次分析",
+		"mem.info.all_procs":           "全部程序（%d 个）",
+		"mem.info.only_proc":           "仅 %s（%d 个）",
+		"mem.info.thread_fail":         "pid %d (%s) 的线程读取失败: %v",
+		"mem.sec.procs":                "程序与线程",
+		"mem.col.scope":                "范围",
+		"mem.col.threads":              "线程数",
+		"mem.col.tid":                  "线程ID",
+		"mem.col.state":                "状态",
+		"mem.col.name":                 "名称",
+		"mem.col.cmd":                  "命令行",
+		"mem.proc.header":              "%5s  %7s  %7s  %-7s %-12s %-20s %s",
+		"mem.proc.none":                "没有匹配到程序",
+		"mem.thread.title":             "各程序的子线程:",
+		"mem.thread.header":            "%7s  %-11s %s",
+		"mem.thread.of":                "pid %d (%s) 共 %d 个线程:",
+		"mem.thread.none":              "pid %d (%s) 没有可列出的线程",
 	},
 
 	En: {
@@ -1061,5 +1879,823 @@ Examples:
 		"hashac.report.pending":    "[!] not cracked (%s): %s",
 		"hashac.report.hint":       "[!] try a larger wordlist or targeted rules and run again",
 		"hashac.report.all_done":   "[+] all targets cracked",
+
+		// ==================== net module ====================
+		"net.group":   "Network Analysis",
+		"net.summary": "Offline analysis of pcap/cap captures: protocols, conversations, DNS/TLS/HTTP and cleartext findings",
+
+		"net.flag.input":           "capture file path (pcap/pcapng/cap, repeatable; a directory scans for capture files)",
+		"net.flag.out":             "write the report to this file (default: print to stdout)",
+		"net.flag.list":            "list packets one by one (default: print the statistics report)",
+		"net.flag.filter":          "filter expression applied to both report and list, e.g. -f \"tcp and port 443\"",
+		"net.flag.top":             "maximum entries per statistics table (default 10)",
+		"net.flag.limit":           "maximum packets to list in list mode (0 = no limit)",
+		"net.flag.quiet":           "quiet mode, do not print notices to stderr",
+		"net.flag.section":         "output only the given report sections, comma separated (io/proto/conv/endpoints/ports/dns/sni/http/findings/attack/all)",
+		"net.flag.json":            "emit JSON instead of the human report, for jq and other tooling",
+		"net.flag.time":            "time range filter: absolute 10:05:00-10:06:00, or seconds relative to first packet 30-90",
+		"net.flag.interval":        "timeline bucket size in seconds, used with -z timeline (default 1)",
+		"net.section.timeline":     "Traffic timeline",
+		"net.tl.interval":          "bucket size",
+		"net.tl.interval_desc":     "%.0f s",
+		"net.tl.span":              "time span",
+		"net.tl.span_desc":         "%s across %d buckets",
+		"net.tl.avg":               "average rate",
+		"net.tl.avg_desc":          "%.1f packets/s",
+		"net.tl.peak":              "peak",
+		"net.tl.peak_desc":         "at %.0fs, %d packets / %s",
+		"net.tl.peak_peer":         "peak source",
+		"net.tl.capped":            "timeline hit the %d bucket limit; the rest was not counted, use -I for a coarser bucket",
+		"net.tl.rows":              "%d non-empty buckets, showing the first %d (adjust with --top)",
+		"net.tl.col_t":             "time(s)",
+		"net.tl.col_pkt":           "packets",
+		"net.tl.col_bytes":         "bytes",
+		"net.tl.col_proto":         "top protocol",
+		"net.err.bad_section":      "unknown -z section: %s (available: io/timeline/proto/conv/endpoints/ports/dns/sni/http/findings/attack/follow/all)",
+		"net.err.bad_follow":       "unrecognized -z follow argument: %s (format: ascii/raw/hex, optional stream index)",
+		"net.err.time_range":       "unrecognized time range: %s (e.g. 10:05:00-10:06:00 or 30-90)",
+		"net.err.time_range_order": "time range ends before it starts",
+		"net.err.json_tui":         "-j and -T are mutually exclusive (JSON targets pipes; the TUI would be overwritten by it)",
+		"net.err.list_section":     "-l and -z are mutually exclusive (-l is a per-packet stream with no sections)",
+		"net.section.follow":       "TCP stream follow",
+		"net.follow.stream":        "stream #%d/%d  %s",
+		"net.follow.from":          "direction 0 (%s):",
+		"net.follow.to":            "direction 1 (%s):",
+		"net.follow.empty":         "(no payload)",
+		"net.follow.truncated":     "this stream exceeded the reassembly limit; content is incomplete",
+		"net.follow.gaps":          "reassembly found %d gaps; missing bytes are zero-filled",
+		"net.follow.no_stream":     "no TCP stream to follow (needs TCP with payload)",
+		"net.follow.no_index":      "stream index %d out of range (%d streams available)",
+		"net.atk.capped":           "statistics hit a map limit; some metrics are incomplete",
+		"net.flag.model":           "enable attack analysis models, comma separated (syn/udp/icmp/flood/cc/loss/frag/all), e.g. -m syn,cc",
+
+		"net.usage": `gyhost net - offline traffic analysis of pcap/cap capture files
+
+usage:
+  gyhost net -i [capture] [options...]
+
+options (grouped by purpose; each entry states only what it does --
+         grammar is in the reference sections below):
+
+  input and output
+    -i, -input    capture file path; repeatable, a directory is scanned
+    -o, -out      write the report to a file, keeping stdout clean
+    -q, --quiet   suppress notices and warnings on stderr
+
+  narrowing the scope
+    -f, --filter  filter expression applied to both report and list
+    -t, --time    time range filter
+    -n, --limit   max packets listed in list mode (0 = unlimited)
+    -I, --interval timeline bucket size in seconds, with -z timeline
+    --top N       max rows per statistics table (default 10)
+
+  choosing the output form (mutually exclusive; default is the report)
+    -l, --list    per-packet list: no, time, endpoints, protocol, length, info
+    -V, --verbose per-packet protocol tree in tshark -V style, with hexdump
+    -T, --tui     interactive full-screen capture browser
+    -j, --json    structured JSON output, for jq and other tooling
+
+  enabling analysis models
+    -m, --model   attack analysis models, see "attack models"
+
+  trimming report sections
+    -z, --section output only the given sections, see "report sections"
+
+filter syntax (-f):
+  shorthand
+    space separated terms are ANDed, "or" for OR, "not" for negation
+    terms       protocol name (tcp/udp/icmp/arp/dns/http/tls/ssh...)
+                [src|dst] host IP      [src|dst] port PORT
+                a bare number means port N
+  display filter form (Wireshark style)
+    expression  field OP value        OP: == != > < >= <= contains
+    logic       && || ! and parentheses ()   a bare protocol name means "exists"
+    fields      frame.*  ip.*  ipv6.*  tcp.*  udp.*  icmp.*  arp.*
+                http.*  dns.*  tls.*  eth.*
+    in the TUI, press / to get live hints while typing, ? to list all fields
+
+time range (-t):
+  absolute    10:05:00-10:06:00
+  relative    30-90 seconds from the first packet (either end may be omitted)
+
+report sections (-z):
+  io          capture overview
+  proto       protocol distribution
+  conv        conversations
+  endpoints   endpoints
+  ports       ports
+  dns         DNS queries
+  sni         TLS SNI
+  http        HTTP hosts and requests
+  findings    security findings
+  attack      attack analysis
+  all         all of the above
+  timeline    traffic over time in buckets, to spot bursts and quiet periods
+  stream      follow,tcp,ascii|raw|hex[,<index>]
+              reassembles out-of-order/retransmitted/segmented packets back
+              into two byte streams, ordered by TCP sequence number
+              ascii printable   raw escaped bytes   hex hexdump
+  aliases     phs=proto   conv=flows   ep=endpoints   tls=sni   stream=follow
+
+attack models (-m):
+  syn    SYN flood, source IP randomization/spoofing
+  udp    UDP flood
+  icmp   ICMP flood
+  flood  generic flood (syn + udp + icmp)
+  cc     CC attack (HTTP layer rate / single source / distributed)
+  loss   packet loss and TCP anomalies (retransmit, dup ACK, zero window, truncation)
+  frag   IP fragmentation anomalies (overlap/malformed, teardrop style)
+  all    all of the above (-m with no value is the same)
+
+what gets analysed:
+  capture overview, four-layer protocol distribution, top conversations /
+  hosts / ports, DNS queries, TLS SNI, cleartext HTTP hosts and request URIs,
+  and security findings (cleartext credentials, HTTP password fields,
+  ARP conflicts, unencrypted cleartext protocols)
+  with -m, per-model verdicts (hit/suspect/none), key metrics and evidence
+
+output:
+  report and list -> stdout, notices and warnings -> stderr
+  with -o the report goes to a file (no color codes) and stdout stays empty
+  for the full TUI key bindings and filter help, press ? inside the TUI
+
+examples:
+  basics
+    gyhost net -i capture.pcap
+    gyhost net -i capture.pcap --top 20
+
+  filtering
+    gyhost net -i capture.pcap -f "host 10.0.0.5"
+    gyhost net -i capture.pcap -f "tcp.port == 443 && !http"
+    gyhost net -i capture.pcap -t 30-90 -f "udp"
+
+  per-packet inspection
+    gyhost net -i capture.pcap -l -n 50
+    gyhost net -i capture.pcap -V -n 5 -f "port 22"
+
+  interactive
+    gyhost net -i capture.pcap -T -f "tcp"
+
+  scripting
+    gyhost net -i capture.pcap -j | jq ".conversations | sort_by(-.packets) | .[0]"
+    gyhost net -i capture.pcap -j -z http | jq ".http.credentials"
+    gyhost net -i capture.pcap -z dns,http
+
+  stream reassembly and timeline
+    gyhost net -i capture.pcap -z "follow,tcp,ascii,0"
+    gyhost net -i capture.pcap -z timeline
+    gyhost net -i capture.pcap -z timeline -I 5
+
+  attack analysis
+    gyhost net -i capture.pcap -m all
+    gyhost net -i capture.pcap -m syn,cc`,
+
+		// ---- net errors ----
+		"net.err.missing_args":          "missing required option: -i [capture file]",
+		"net.err.no_input":              "no usable capture input (path missing, or the directory contains no capture files)",
+		"net.err.bad_top":               "--top must be greater than 0: %d",
+		"net.err.bad_limit":             "-n/--limit must not be negative: %d",
+		"net.err.open":                  "cannot read %s: %v",
+		"net.err.unrecognized":          "%s is not a supported capture container (pcap/pcapng only)",
+		"net.err.bad_capture":           "failed to parse the capture: %v",
+		"net.err.create_out":            "failed to create the report file: %v",
+		"net.err.filter_missing":        "incomplete filter expression, missing argument after %s",
+		"net.err.filter_ip":             "unrecognized IP address: %s",
+		"net.err.filter_port":           "unrecognized port number: %s",
+		"net.err.filter_token":          "unrecognized filter term: %s",
+		"net.err.filter_dir":            "%s can only be combined with host or port",
+		"net.err.filter_unknown_field":  "unknown field: %s (press \x1b[5m?\x1b[0m for available fields)",
+		"net.err.filter_char":           "illegal character in filter: %s",
+		"net.err.filter_unterminated":   "unterminated string in filter",
+		"net.err.filter_unclosed_paren": "unclosed parenthesis in filter",
+		"net.err.filter_number":         "not a valid number: %s",
+		"net.err.filter_empty":          "empty filter expression",
+		"net.err.bad_model":             "unknown analysis model: %s (available: %s)",
+
+		// ---- net notices ----
+		"net.info.saved": "report written to %s",
+
+		// ---- net overview ----
+		"net.label.format":          "Format",
+		"net.label.linktype":        "Link type",
+		"net.label.filter":          "Filter",
+		"net.label.packets":         "Packets",
+		"net.label.time":            "Time range",
+		"net.label.bytes":           "Traffic",
+		"net.label.models":          "Models",
+		"net.label.peak":            "Peak rate",
+		"net.packets.filtered":      "%d (after filter %d)",
+		"net.time.desc":             "%s -> %s (%s)",
+		"net.bytes.desc":            "captured %s, on the wire %s",
+		"net.endian.le":             "little-endian",
+		"net.endian.be":             "big-endian",
+		"net.ts.sec":                "second timestamps",
+		"net.ts.msec":               "millisecond timestamps",
+		"net.ts.usec":               "microsecond timestamps",
+		"net.ts.nsec":               "nanosecond timestamps",
+		"net.format.ifaces":         "%d interfaces",
+		"net.link.unknown":          "unknown link type (DLT %d)",
+		"net.warn.unsupported_link": "unsupported link type %d, skipped %d frame(s)",
+		"net.report.no_match":       "no packets matched the filter",
+
+		// ---- net sections and table headers ----
+		"net.section.protocols": "Protocol distribution",
+		"net.section.flows":     "Top conversations (%d)",
+		"net.section.endpoints": "Top hosts (%d)",
+		"net.section.ports":     "Top ports (%d)",
+		"net.section.dns":       "DNS queries",
+		"net.section.sni":       "TLS SNI",
+		"net.section.http":      "HTTP",
+		"net.section.findings":  "Security findings",
+		"net.section.attack":    "Attack analysis",
+		"net.layer.l2":          "Link",
+		"net.layer.l3":          "Network",
+		"net.layer.l4":          "Transport",
+		"net.layer.l7":          "Application",
+		"net.subsection.hosts":  "Hosts",
+		"net.subsection.uris":   "Request URIs",
+		"net.head.layer":        "Layer",
+		"net.head.proto":        "Proto",
+		"net.head.packets":      "Pkts",
+		"net.head.percent":      "%",
+		"net.head.bytes":        "Bytes",
+		"net.head.rank":         "#",
+		"net.head.flow":         "Conversation",
+		"net.head.host":         "Host",
+		"net.head.ip":           "IP",
+		"net.head.mac":          "MAC",
+		"net.head.sent":         "Sent",
+		"net.head.recv":         "Recv",
+		"net.head.port":         "Port",
+		"net.head.service":      "Service",
+		"net.head.name":         "Name",
+		"net.head.count":        "Count",
+		"net.head.uri":          "URI",
+		"net.head.idx":          "#",
+		"net.head.time":         "Time",
+		"net.head.endpoints":    "Endpoints",
+		"net.head.len":          "Len",
+		"net.head.info":         "Info",
+		"net.head.model":        "Model",
+		"net.head.verdict":      "Verdict",
+		"net.head.metrics":      "Key metrics",
+
+		// ---- net accounting ----
+		"net.proto.unidentified": "unidentified",
+		"net.proto.other":        "Other",
+		"net.service.unknown":    "unregistered",
+		"net.packets_fmt":        "%d packets",
+		"net.dns.summary":        "%d queries, %d unique names, %d failed responses",
+		"net.http.summary":       "%d cleartext HTTP request(s)",
+		"net.list.summary":       "%d packets total, %d matched, %d listed",
+
+		// ---- net per-packet summaries ----
+		"net.info.beacon":       "beacon (SSID: %s)",
+		"net.info.probe_req":    "probe request (SSID: %s)",
+		"net.info.arp_req":      "who has %s? tell %s",
+		"net.info.arp_rep":      "%s is at %s",
+		"net.info.echo_req":     "echo request id=%d seq=%d",
+		"net.info.echo_rep":     "echo reply id=%d seq=%d",
+		"net.info.icmp_unreach": "destination unreachable (code=%d)",
+		"net.info.icmp_ttl":     "time exceeded (code=%d)",
+		"net.info.icmp":         "type=%d code=%d",
+		"net.info.nd_ns":        "neighbor solicitation %s",
+		"net.info.nd_na":        "neighbor advertisement %s",
+		"net.info.nd_rs":        "router solicitation",
+		"net.info.nd_ra":        "router advertisement",
+		"net.info.ipv4_frag":    "IPv4 fragment offset=%d",
+		"net.info.ipv6_frag":    "IPv6 fragment offset=%d",
+
+		// ---- net attack analysis ----
+		"net.verdict.hit":       "Detected",
+		"net.verdict.suspect":   "Suspected",
+		"net.verdict.miss":      "Not detected",
+		"net.model.syn":         "SYN flood",
+		"net.model.udp":         "UDP flood",
+		"net.model.icmp":        "ICMP flood",
+		"net.model.cc":          "CC attack",
+		"net.model.loss":        "Packet loss / TCP anomalies",
+		"net.model.frag":        "IP fragment anomalies",
+		"net.metric.syn":        "SYNs %d (peak %d/s), SYN-ACKs %d, %d source IPs, %s of TCP",
+		"net.metric.udp":        "UDP %d packets (peak %d/s), %s of all packets",
+		"net.metric.icmp":       "ICMP %d packets (peak %d/s), %s of all packets",
+		"net.metric.cc":         "HTTP requests %d (peak %d/s), top source %s x%d, top URI %s x%d",
+		"net.metric.loss":       "retransmits %d (%s of data segments), dup ACKs %d, seq gaps %d, zero windows %d, truncated %d",
+		"net.metric.frag":       "%d fragments, %d overlapping, %d malformed",
+		"net.attack.syn":        "possible SYN flood: %d SYNs vs %d SYN-ACKs, peak %d/s, SYNs are %s of TCP",
+		"net.attack.random_src": "randomized/spoofed sources: %d sources appear once and only send SYNs (%d SYN sources in total, %s)",
+		"net.attack.udp":        "possible UDP flood: peak %d/s, %s of all packets",
+		"net.attack.icmp":       "possible ICMP flood: peak %d/s, %s of all packets",
+		"net.attack.cc":         "possible CC attack: %d HTTP requests, peak %d/s, top source %s (%d), top URI %s (%d)",
+		"net.attack.cc_dist":    "distributed CC: URI %s requested by %d distinct sources, %d times",
+		"net.attack.cc_single":  "single-source hammering: %s made %d requests, %s of all requests",
+		"net.attack.loss":       "TCP anomalies: %d retransmits (%s of data segments), %d dup ACKs, %d seq gaps, %d zero windows",
+		"net.attack.trunc":      "truncated capture: %d packets captured shorter than on the wire, statistics are incomplete",
+		"net.attack.frag":       "fragment anomalies: %d overlapping, %d malformed fragments (teardrop-style)",
+		"net.attack.capped":     "tracking key limit %d reached, some metrics are incomplete",
+
+		// ---- net 逐包详细视图（-V）----
+		"net.flag.verbose":       "per-packet detail view (protocol tree like tshark -V; implies -l)",
+		"net.det.frame_hdr":      "Frame %d: %d bytes on wire (%d bits), %d bytes captured (%d bits)",
+		"net.det.encap":          "Encapsulation type",
+		"net.det.arrival":        "Arrival time",
+		"net.det.epoch":          "Epoch time",
+		"net.det.since_ref":      "Time since first frame",
+		"net.det.seconds":        "seconds",
+		"net.det.frame_no":       "Frame number",
+		"net.det.frame_len":      "Frame length",
+		"net.det.cap_len":        "Capture length",
+		"net.det.truncated":      "Truncated",
+		"net.det.protocols":      "Protocols in frame",
+		"net.det.yes":            "Yes",
+		"net.det.none":           "None",
+		"net.det.set":            "Set",
+		"net.det.notset":         "Not set",
+		"net.det.info":           "Info",
+		"net.det.eth_hdr":        "Ethernet II, Src: %s, Dst: %s",
+		"net.det.dst":            "Destination",
+		"net.det.src":            "Source",
+		"net.det.vlan_idx":       "VLAN %d ID",
+		"net.det.type":           "Type",
+		"net.det.etype":          "%s (0x%04x)",
+		"net.det.ipv4_hdr":       "Internet Protocol Version 4, Src: %s, Dst: %s",
+		"net.det.ipv6_hdr":       "Internet Protocol Version 6, Src: %s, Dst: %s",
+		"net.det.version":        "Version",
+		"net.det.hdr_len":        "Header length",
+		"net.det.bytes":          "%d bytes (%d)",
+		"net.det.bytes_bits":     "%d bytes (%d bits)",
+		"net.det.dsfield":        "Differentiated Services Field",
+		"net.det.total_len":      "Total length",
+		"net.det.ident":          "Identification",
+		"net.det.flags":          "Flags",
+		"net.det.df":             "Don't fragment (DF)",
+		"net.det.mf":             "More fragments (MF)",
+		"net.det.frag_off":       "Fragment offset",
+		"net.det.frag_off_val":   "%d (%d bytes)",
+		"net.det.ttl":            "Time to live",
+		"net.det.hop_limit":      "Hop limit",
+		"net.det.protocol":       "Protocol",
+		"net.det.next_hdr":       "Next header",
+		"net.det.hdr_cksum":      "Header checksum",
+		"net.det.src_addr":       "Source address",
+		"net.det.dst_addr":       "Destination address",
+		"net.det.tclass":         "Traffic class",
+		"net.det.flow_label":     "Flow label",
+		"net.det.payload_len":    "Payload length",
+		"net.det.tcp_hdr":        "Transmission Control Protocol, Src Port: %d, Dst Port: %d, Seq: %d, Ack: %d, Len: %d",
+		"net.det.udp_hdr":        "User Datagram Protocol, Src Port: %d, Dst Port: %d, Len: %d",
+		"net.det.icmp_hdr":       "%s, Type: %d, Code: %d",
+		"net.det.icmp_type":      "%s (%d)",
+		"net.det.src_port":       "Source port",
+		"net.det.dst_port":       "Destination port",
+		"net.det.seq":            "Sequence number",
+		"net.det.ack":            "Acknowledgment number",
+		"net.det.tcp_flags":      "Flags",
+		"net.det.window":         "Window size",
+		"net.det.checksum":       "Checksum",
+		"net.det.urgent_ptr":     "Urgent pointer",
+		"net.det.length":         "Length",
+		"net.det.service":        "Service",
+		"net.det.code":           "Code",
+		"net.det.icmp_id":        "Identifier",
+		"net.det.icmp_seq":       "Sequence number",
+		"net.det.options":        "Options",
+		"net.det.opt_kind":       "Option kind: %s",
+		"net.det.flag.cwr":       "CWR",
+		"net.det.flag.ece":       "ECE",
+		"net.det.flag.urg":       "URG",
+		"net.det.flag.ack":       "ACK",
+		"net.det.flag.psh":       "PSH",
+		"net.det.flag.rst":       "RST",
+		"net.det.flag.syn":       "SYN",
+		"net.det.flag.fin":       "FIN",
+		"net.det.arp_hdr":        "Address Resolution Protocol: %s",
+		"net.det.hw_type":        "Hardware type",
+		"net.det.proto_type":     "Protocol type",
+		"net.det.hw_size":        "Hardware size",
+		"net.det.proto_size":     "Protocol size",
+		"net.det.arp_op":         "Opcode",
+		"net.det.arp_request":    "who has? (1)",
+		"net.det.arp_reply":      "is at (2)",
+		"net.det.arp_other":      "other",
+		"net.det.arp_sender_mac": "Sender MAC address",
+		"net.det.arp_sender_ip":  "Sender IP address",
+		"net.det.arp_target_mac": "Target MAC address",
+		"net.det.arp_target_ip":  "Target IP address",
+		"net.det.http_host":      "Host",
+		"net.det.http_cred":      "Authorization",
+		"net.det.http_pass":      "Cleartext password field",
+		"net.det.dns_name":       "Query name",
+		"net.det.dns_ans":        "Answers",
+		"net.det.tls_sni":        "SNI",
+		"net.det.frame_data":     "Frame data",
+
+		// ---- net interactive TUI (-T) ----
+		"net.flag.tui":                "interactive packet browser: full-screen list + protocol tree, scroll/select/filter live (needs a terminal)",
+		"net.tui.no":                  "No",
+		"net.tui.source":              "Source",
+		"net.tui.dest":                "Destination",
+		"net.tui.proto":               "Proto",
+		"net.tui.length":              "Length",
+		"net.tui.info":                "Info",
+		"net.tui.detail":              "Protocol tree",
+		"net.tui.detail_sel":          "(frame %d, %d shown)",
+		"net.tui.packets":             "packets",
+		"net.tui.no_filter":           "(no filter)",
+		"net.tui.filter_prompt":       "filter> ",
+		"net.tui.filter_canceled":     "filter editing canceled",
+		"net.tui.filter_cleared":      "filter cleared",
+		"net.tui.filter_hint_empty":   "press Enter to clear the filter, or type an expression",
+		"net.tui.filter_hint_ok":      "syntax OK, press Enter to apply",
+		"net.tui.filter_ex_empty":     "e.g. tcp.port == 443 · ip.addr == 10.0.0.1 · frame.len > 1000 · http.host contains \"x\" · !(arp)",
+		"net.tui.filter_ex_port":      "ports: tcp.port == 443 · src port 1024 · udp.port != 53",
+		"net.tui.filter_ex_ip":        "addresses: ip.addr == 10.0.0.1 · src host 192.168.1.1 · ip.dst != 8.8.8.8",
+		"net.tui.filter_ex_len":       "length: frame.len > 1000 · frame.len <= 1500 · tcp.payload_len >= 100",
+		"net.tui.filter_ex_generic":   "e.g. tcp · tcp && port == 443 · (tcp || udp) && !arp · dns.qry.name contains \"example\"",
+		"net.tui.filter_ex_ipfield":   "%s takes an IP: %s == 10.0.0.1 (or src host 10.0.0.1)",
+		"net.tui.filter_ex_intfield":  "%s takes a number: %s == 443 · %s > 100 · %s != 0",
+		"net.tui.filter_ex_strfield":  "%s takes a string: %s contains \"x\" · %s == \"abc\"",
+		"net.tui.filter_ex_boolfield": "%s is a boolean: %s == 1 (set) or == 0 (not set)",
+		"net.tui.sug_none":            "hint: field + operator + value, e.g. tcp.port == 443; Tab completes, ? lists all fields",
+		"net.tui.sug_field":           "fields:",
+		"net.tui.sug_field_prefix":    "complete \"%s\":",
+		"net.tui.sug_no_field":        "no field starts with %s, press ? to list all",
+		"net.tui.sug_operator":        "operators for %s: %s",
+		"net.tui.sug_value_generic":   "type a value after the operator",
+		"net.tui.sug_val_ip":          "%s needs an IP address, e.g. %s == 10.0.0.1",
+		"net.tui.sug_val_int":         "%s needs a number, e.g. %s == 443, or %s > 100",
+		"net.tui.sug_val_str":         "%s needs a quoted string, e.g. %s contains \"x\"",
+		"net.tui.sug_val_bool":        "%s is a boolean: %s == 1 or %s == 0",
+		"net.tui.sug_val_float":       "%s needs a number, e.g. %s > 1.5",
+		"net.tui.sug_logic":           "condition complete; chain with && or ||, or press Enter to apply",
+		"net.tui.sug_tab":             "   (Tab to accept)",
+		"net.tui.empty":               "no packets match the filter",
+		"net.tui.no_match":            "no packets match; press c to clear the filter or r to re-apply",
+		"net.tui.key_move":            "move",
+		"net.tui.key_pane":            "pane",
+		"net.tui.key_fold":            "fold",
+		"net.tui.key_filter":          "filter",
+		"net.tui.key_stats":           "stats",
+		"net.tui.key_bytes":           "bytes",
+		"net.tui.key_help":            "help",
+		"net.tui.key_quit":            "quit",
+		"net.tui.key_enter":           "expand",
+		"net.tui.key_fold_all":        "fold all",
+		"net.tui.key_scroll":          "scroll",
+		"net.tui.help_title":          "Keyboard shortcuts",
+		"net.tui.help_move":           "move selection up/down",
+		"net.tui.help_fold":           "collapse / expand current node",
+		"net.tui.help_fold_all":       "collapse / expand all",
+		"net.tui.help_pane":           "switch focus: list / tree / bytes",
+		"net.tui.help_enter":          "show or hide the detail panes",
+		"net.tui.help_filter":         "open filter input (e.g. tcp.port == 443)",
+		"net.tui.help_history":        "browse filter history while typing",
+		"net.tui.help_esc":            "cancel editing; press again to clear filter",
+		"net.tui.help_help":           "open / close this help",
+		"net.tui.help_stats":          "statistics panel (protocols / endpoints / conversations)",
+		"net.tui.help_clear":          "clear filter, show all packets",
+		"net.tui.help_reapply":        "re-apply the current filter",
+		"net.tui.help_jump":           "jump to first / last packet",
+		"net.tui.help_page":           "page up / down",
+		"net.tui.help_quit":           "quit",
+		"net.tui.help_filter_fields":  "Fields available in filters:",
+		"net.tui.filter_help":         "Available filter fields",
+		"net.tui.filter_help_hint":    "e.g. ip.addr == 10.0.0.1 && tcp.port == 443; up/down history, Esc cancel, ? close help",
+		"net.tui.time":                "Time",
+		"net.tui.bytes":               "Bytes",
+		"net.tui.tree":                "Protocol tree",
+		"net.tui.stats":               "Statistics",
+		"net.tui.pane_list":           "Packet list",
+		"net.tui.focus":               "focus",
+		"net.tui.stat_proto":          "Protocol distribution",
+		"net.tui.stat_endpoint":       "Endpoints",
+		"net.tui.stat_convers":        "Conversations",
+		"net.tui.stat_calculating":    "calculating…",
+		"net.tui.stat_none":           "nothing to summarize",
+		"net.tui.collapse_all":        "all collapsed",
+		"net.tui.expand_all":          "all expanded",
+		"net.tui.no_bytes":            "this frame has no raw bytes",
+		"net.tui.name":                "Name",
+		"net.tui.stat_summary":        "%d packets / %s",
+		"net.tui.percent":             "%",
+		"net.err.no_tty":              "interactive mode needs a terminal (stdin/stdout must be a TTY); use -l or -V instead",
+		"net.err.tui_output":          "-T takes over the terminal and cannot be combined with -o",
+		"net.err.frame_range":         "frame index out of range: %d",
+
+		// ---- net security findings ----
+		"net.find.none":      "no obvious security issues found",
+		"net.find.cred":      "cleartext credential captured: %s",
+		"net.find.field":     "cleartext password field in HTTP request: %s",
+		"net.find.arp":       "same IP seen with multiple MACs, possible ARP spoofing",
+		"net.find.cleartext": "unencrypted plaintext protocol traffic",
+
+		// ==================== mem module ====================
+		"mem.group":   "Memory Forensics",
+		"mem.summary": "Memory forensics: analyze a live process or a memory dump, recover program behavior and carve files out of memory",
+
+		"mem.flag.input":    "analysis target: process PID, self (current process), or path to a memory dump file",
+		"mem.flag.action":   "actions to run, comma separated and repeatable (info/maps/strings/behavior/carve/hash/entropy/dump/all)",
+		"mem.flag.carvedir": "write recovered files into this directory",
+		"mem.flag.type":     "file types to carve, comma separated (all by default, or png/jpg/zip/pdf/pe/sqlite...)",
+		"mem.flag.filter":   "only keep strings and behavior hits containing this keyword (case insensitive)",
+		"mem.flag.region":   "only analyze these regions: type (image/heap/stack/mapped/anon), all, or an address range 0x1000-0x2000",
+		"mem.flag.minsize":  "skip regions smaller than this many bytes",
+		"mem.flag.maxsize":  "skip regions larger than this many bytes (0 = no limit)",
+		"mem.flag.minlen":   "minimum string length (default 4)",
+		"mem.flag.limit":    "maximum rows printed per section (default 50)",
+		"mem.flag.encoding": "string encoding: ascii / utf16 / both (default both)",
+		"mem.flag.addr":     "write target address: 0x1234, decimal, or region+offset (e.g. heap+0x40)",
+		"mem.flag.data":     "content to write/replace: \\xNN byte sequence, @filepath, or plain UTF-8 text",
+		"mem.flag.apply":    "actually perform the write; without it only a preview is computed and the target is untouched",
+		"mem.flag.force":    "allow writing to regions/targets without write permission (denied by default)",
+		"mem.flag.backup":   "rollback record file (a backup is written on every apply, replayable with -a restore)",
+		"mem.flag.max":      "maximum number of replacements per run (unlimited for patch by default)",
+		"mem.flag.out":      "write the report to this file (default: print to stdout)",
+		"mem.flag.dump":     "export the memory image to this file (same as -a dump)",
+		"mem.flag.json":     "emit JSON instead of the human report, for jq and other tooling",
+		"mem.flag.verbose":  "verbose mode: list every region (including unselected ones) and loaded modules",
+		"mem.flag.quiet":    "quiet mode, do not print per-region progress to stderr",
+		"mem.flag.nonascii": "keep non-ASCII strings",
+		"mem.flag.showall":  "do not limit the number of rows (output can be long)",
+
+		"mem.usage": `gyhost mem - memory forensics on a live process or a memory dump file
+
+Usage:
+  gyhost mem -i <pid|self|dump-file> [-a action] [options...]
+
+Flags (identical on every platform; the backend is compiled per OS):
+
+  -i, -input     analysis target
+                    <pid>       a running process
+                    self        the current process
+                    <file>      a memory dump file (raw/dmp/bin, analyzable anywhere)
+  -e, -program   analyze the given program by PID or name, no PID lookup needed
+                  matches the process name / executable name / command line;
+                  when several match, each one is analyzed in turn
+  -l, -list      list programs and their threads (value optional)
+                  -l            every program, together with its threads
+                  -l <PID|name> only the threads of that program
+  -a, -action    actions to run, comma separated and repeatable (default info,behavior)
+  -o, -out       write the report to a file, keeping stdout clean
+  -q, -quiet     do not print per-region progress to stderr
+
+  Narrow the scope
+  -r, -region    only analyze the given regions: image / heap / stack / mapped / anon
+                  or an address range, e.g. -r 0x7f0000000000-0x7f0000100000
+  -s, -minsize   skip regions smaller than this many bytes
+  -S, -maxsize   skip regions larger than this many bytes
+  -k, -filter    only keep strings and hits containing this keyword
+  -L, -minlen    minimum string length
+  -E, -encoding  string encoding: ascii / utf16 / both
+  -n, -limit     maximum rows per section (default 50)
+  -X, -showall   do not limit rows
+
+  Output format
+  -j, -json      JSON output, ready for jq and other tooling
+  -V, -verbose   verbose mode (all regions + loaded modules)
+
+  Carve files out of memory
+  -c, -carvedir  write recovered files into this directory
+  -t, -type      only carve these types, comma separated (all = everything)
+
+  Export a memory image
+  -d, -dump      export the memory image as a raw dump (with a .index sidecar)
+
+Operate on the target's memory (change its behavior)
+  -a write       write -Y content at the address given by --addr
+  -a patch       replace the -k content in memory with the -Y content
+  -a restore     roll back, restoring the memory to its pre-patch content
+  --addr ADDR    target address: 0x1234, decimal, or region+offset (e.g. heap+0x40)
+  -Y DATA        content to write/replace: \xNN bytes, @filepath, or plain UTF-8 text
+  --apply        really write (without it: preview only, target untouched)
+  --force        allow writing to regions/targets without write permission (denied by default)
+  --backup FILE  rollback record file (auto-written on apply, read by -a restore)
+  --max N        maximum number of replacements per run
+
+Actions (-a):
+  info      target overview: process info, region stats, kind distribution, overall digests
+  maps      memory region list (address, permission, kind, backing file)
+  strings   string extraction (ASCII and UTF-16LE)
+  behavior  program behavior: URL/IP/domain/credentials/commands/injection & persistence traces
+  carve     recover files embedded in memory (by magic bytes)
+  hash      per-region digests (md5 / sha256)
+  entropy   per-region entropy (tells plaintext / compressed / encrypted apart)
+  dump      export the memory image as a raw dump
+  write     write into memory at an address (needs --addr + -Y + --apply)
+  patch     search & replace inside memory (needs -k + -Y + --apply)
+  restore   roll back to the pre-patch content (needs --backup + --apply)
+  all       everything except dump / write / patch / restore
+            (write actions must be named explicitly, "all" never triggers them)
+
+Carvable file types:
+  png jpg gif pdf zip gzip bmp elf sqlite 7z rar dex tiff wav pe class lnk
+  (-t all means no type filter)
+
+Behavior categories (-a behavior):
+  network  url ip domain email port
+  secrets  password private_key aws_key jwt basic_auth shadow
+  host     path_unix path_win registry env command
+  forensics injection cred_dump persist anti_forensic mining ransom
+
+Examples:
+  gyhost mem -l                                       # list every program and its threads
+  gyhost mem -l nginx                                 # only the threads of the nginx program
+  gyhost mem -l 1234                                  # only the threads of pid 1234
+  gyhost mem -e nginx                                 # analyze by program name
+  gyhost mem -e nginx -a info,behavior                # overview + behavior by name
+  gyhost mem -i self                                  # analyze the current process
+  gyhost mem -i 1234 -a info,maps                     # inspect a process memory map
+  gyhost mem -i 1234 -a behavior -s 1048576           # behavior scan, skip regions < 1 MiB
+  gyhost mem -i 1234 -a carve -c ./carved -t png,zip  # carve png/zip out of memory
+  gyhost mem -i memdump.raw -a all -o report.txt      # offline analysis written to a file
+  gyhost mem -i memdump.raw -a strings -k password    # only strings containing "password"
+  gyhost mem -i 1234 -a dump -d target.memdump        # export memory as evidence
+  gyhost mem -i 1234 -a patch -k production -Y staging # preview: production -> staging
+  gyhost mem -i 1234 -a patch -k production -Y staging --apply   # really patch memory
+  gyhost mem -i mem.bin -a write --addr heap+0x40 -Y '\x00\x01' --apply
+  gyhost mem -i 1234 -a restore --backup mem-nginx-*.bak --apply  # roll back
+  gyhost mem -i memdump.raw -a info -j | jq .summary # JSON into a pipeline
+  gyhost help mem`,
+
+		// ---- mem notices ----
+		"mem.info.opening":  "opening target: %s",
+		"mem.info.region":   "scanned region %s  (%s)",
+		"mem.info.selected": "%d (skipped %d)",
+		"mem.info.scanned":  "%s, complete %d / interrupted %d",
+		"mem.info.saved":    "report written to: %s",
+		"mem.info.dumped":   "memory image exported: %s (%s, %d regions)",
+		"mem.dump.summary":  "exported %d regions, %s total to: %s",
+		"mem.dump.index":    "region index: %s",
+
+		// ---- mem errors ----
+		"mem.err.missing_input": "missing required option: -i <pid|self|dump-file>",
+		"mem.err.bad_action":    "unknown -a action: %s (available: info/maps/strings/behavior/carve/hash/entropy/dump/all)",
+		"mem.err.bad_target":    "unrecognized -i target: %s",
+		"mem.err.bad_region":    "unrecognized -r region filter: %s (use all/image/heap/stack/mapped/anon or an address range)",
+		"mem.err.bad_minsize":   "-s minimum region size must be >= 0 (got %d)",
+		"mem.err.bad_maxsize":   "-S maximum region size must be >= 0 (got %d)",
+		"mem.err.bad_minlen":    "-L minimum string length must be within 1..4096 (got %d)",
+		"mem.err.bad_limit":     "-n row limit must be >= 0 (got %d)",
+		"mem.err.size_range":    "-s(%d) cannot be greater than -S(%d)",
+		"mem.err.bad_encoding":  "unknown -e encoding: %s (available: ascii/utf16/both)",
+		"mem.err.json_carve":    "-j cannot be combined with -c (JSON targets pipelines, run -c separately to save files)",
+		"mem.err.privilege":     "insufficient privileges to read process memory on %s: %s",
+		"mem.err.unsupported":   "live memory access is not implemented on this platform (%s); you can still analyze an image with -i <dump-file>",
+		"mem.err.no_process":    "process not found: %s",
+		"mem.err.gone":          "process exited or memory is not readable: %s (%v)",
+		"mem.err.open_target":   "failed to open target: %s (%v)",
+		"mem.err.open_file":     "failed to open memory dump file: %s (%v)",
+		"mem.err.regions":       "failed to read the memory region list: %v",
+		"mem.err.no_regions":    "the target has no readable memory regions",
+		"mem.err.no_selected":   "no regions left after filtering, relax -r / -s / -S",
+		"mem.err.create_out":    "failed to create the output file: %v",
+		"mem.err.write_out":     "failed to write the output file: %v",
+		"mem.err.create_dir":    "failed to create the recovery directory: %s (%v)",
+		"mem.err.write_file":    "failed to write a recovered file: %s (%v)",
+
+		// ---- mem report ----
+		"mem.sec.overview": "Target Overview",
+		"mem.sec.maps":     "Memory Regions",
+		"mem.sec.entropy":  "Region Entropy",
+		"mem.sec.hash":     "Region Digests",
+		"mem.sec.behavior": "Program Behavior",
+		"mem.sec.strings":  "Strings",
+		"mem.sec.carve":    "Files Recovered From Memory",
+
+		"mem.kind.live":          "live process",
+		"mem.kind.file":          "memory dump file",
+		"mem.kind.url":           "URL",
+		"mem.kind.ip":            "IPv4 address",
+		"mem.kind.domain":        "domain",
+		"mem.kind.email":         "email",
+		"mem.kind.port":          "port",
+		"mem.kind.password":      "password / credential",
+		"mem.kind.private_key":   "private key material",
+		"mem.kind.aws_key":       "cloud access key",
+		"mem.kind.jwt":           "JWT token",
+		"mem.kind.basic_auth":    "HTTP Basic auth header",
+		"mem.kind.shadow":        "shadow password line",
+		"mem.kind.path_unix":     "Unix path",
+		"mem.kind.path_win":      "Windows path",
+		"mem.kind.registry":      "registry key",
+		"mem.kind.env":           "environment variable",
+		"mem.kind.command":       "command line",
+		"mem.kind.injection":     "process injection API",
+		"mem.kind.cred_dump":     "credential theft trace",
+		"mem.kind.persist":       "persistence trace",
+		"mem.kind.anti_forensic": "anti-forensics trace",
+		"mem.kind.mining":        "crypto mining trace",
+		"mem.kind.ransom":        "ransomware trace",
+
+		"mem.col.kind":     "target kind",
+		"mem.col.target":   "target",
+		"mem.col.pid":      "process",
+		"mem.col.ppid":     "ppid",
+		"mem.col.proc":     "process name",
+		"mem.col.exe":      "executable",
+		"mem.col.arch":     "arch",
+		"mem.col.user":     "user",
+		"mem.col.started":  "start time",
+		"mem.col.vsize":    "virtual memory",
+		"mem.col.regions":  "regions",
+		"mem.col.selected": "analyzed",
+		"mem.col.exec":     "executable",
+		"mem.col.scanned":  "read",
+		"mem.col.total":    "overall digest",
+		"mem.col.start":    "start address",
+		"mem.col.end":      "end address",
+		"mem.col.size":     "size",
+		"mem.col.perm":     "perm",
+		"mem.col.path":     "backing file",
+		"mem.col.entropy":  "entropy",
+		"mem.col.class":    "class",
+		"mem.col.risk":     "risk",
+		"mem.col.offset":   "offset",
+		"mem.col.value":    "value",
+		"mem.col.enc":      "enc",
+		"mem.col.type":     "type",
+		"mem.col.score":    "score",
+		"mem.col.saved":    "saved",
+
+		"mem.bykind":                   "by region kind:",
+		"mem.modules":                  "loaded modules (%d):",
+		"mem.more":                     "%d more rows not shown (use -n to adjust or -X for everything)",
+		"mem.none":                     "(none)",
+		"mem.maps.header":              "%-16s %-16s %10s  %-4s %-6s %s",
+		"mem.entropy.header":           "%8s %-7s %10s  %-6s %s",
+		"mem.hash.header":              "%-16s %10s  %-6s %-32s %s",
+		"mem.behavior.header":          "%-6s %-12s %-16s  %s",
+		"mem.behavior.stats":           "by category:",
+		"mem.behavior.count":           "hits",
+		"mem.behavior.none":            "no notable behavior traces found",
+		"mem.strings.header":           "%-16s  %-7s  %s",
+		"mem.strings.none":             "no strings extracted",
+		"mem.carve.header":             "%-8s %-16s %10s  %3s %-64s %s",
+		"mem.carve.none":               "no files carved",
+		"mem.carve.saved":              "%d files saved to: %s",
+		"mem.risk.0":                   "none",
+		"mem.risk.1":                   "info",
+		"mem.risk.2":                   "suspicious",
+		"mem.risk.3":                   "high",
+		"mem.sec.patch":                "Memory Patch",
+		"mem.col.op":                   "op",
+		"mem.col.mode":                 "mode",
+		"mem.col.hits":                 "hits",
+		"mem.col.skipped":              "refused",
+		"mem.col.written":              "written",
+		"mem.col.addr":                 "address",
+		"mem.col.before":               "before",
+		"mem.col.after":                "after",
+		"mem.col.status":               "status",
+		"mem.patch.header":             "%-16s  %-22s -> %-22s %s",
+		"mem.patch.preview":            "PREVIEW (nothing written)",
+		"mem.patch.applied":            "APPLIED",
+		"mem.patch.ok":                 "OK",
+		"mem.patch.none":               "nothing matched to patch",
+		"mem.patch.hint":               "this is a preview only; add --apply to really write into the target memory",
+		"mem.info.backup_saved":        "rollback records saved (%d): %s",
+		"mem.warn.backup_failed":       "failed to save rollback records: %s (%v)",
+		"mem.warn.bad_record":          "unparsable rollback record at %#x, skipped: %v",
+		"mem.warn.restore_unreadable":  "address %#x is no longer readable, cannot roll back",
+		"mem.warn.restore_failed":      "failed to roll back address %#x: %v",
+		"mem.err.not_writable":         "target is not writable on %s: no write permission; retry as root/administrator, or export with -d and patch the image instead",
+		"mem.err.write_need_target":    "write/patch/restore needs a target: -i <pid|self|dump-file> or -e <program>",
+		"mem.err.write_need_addr":      "-a write needs --addr with the target address",
+		"mem.err.write_need_data":      "use -Y to specify the content to write",
+		"mem.err.patch_need_data":      "use -Y to specify the replacement content",
+		"mem.err.patch_need_needle":    "use -k to specify the content to search for (raw bytes or text)",
+		"mem.err.bad_data":             "cannot parse the -Y value: %v",
+		"mem.err.bad_addr":             "cannot parse --addr: %s",
+		"mem.err.no_such_region":       "no region of kind %s (run -a maps to see the available ones)",
+		"mem.err.addr_out_of_region":   "offset %#x falls outside the %s region (%s)",
+		"mem.err.bad_max":              "--max must be >= 0 (got %d)",
+		"mem.err.restore_need_backup":  "-a restore needs --backup <rollback record file>",
+		"mem.err.no_backup":            "the rollback record file contains no records",
+		"mem.err.restore_preview_only": "rollback was only previewed; add --apply to really write it back",
+		"mem.err.no_write_action":      "no write action given (write / patch / restore)",
+		"mem.err.target_conflict":      "-i and -e cannot be combined (both specify an analysis target)",
+		"mem.err.no_match":             "no program matched: %s (run -l to list programs first)",
+		"mem.err.list_processes":       "failed to enumerate processes on %s: %v",
+		"mem.err.threads_unsupported":  "thread enumeration is not available on this platform (%s)",
+		"mem.info.matched":             "matched program: pid %d (%s)",
+		"mem.info.self_target":         "self (pid %d, %s)",
+		"mem.info.proc_target":         "%s (pid %d)",
+		"mem.info.multi_match":         "%s matched %d processes, analyzing them one by one",
+		"mem.info.all_procs":           "all programs (%d)",
+		"mem.info.only_proc":           "only %s (%d)",
+		"mem.info.thread_fail":         "failed to read threads of pid %d (%s): %v",
+		"mem.sec.procs":                "Programs And Threads",
+		"mem.col.scope":                "scope",
+		"mem.col.threads":              "threads",
+		"mem.col.tid":                  "TID",
+		"mem.col.state":                "state",
+		"mem.col.name":                 "name",
+		"mem.col.cmd":                  "command line",
+		"mem.proc.header":              "%5s  %7s  %7s  %-7s %-12s %s",
+		"mem.proc.none":                "no program matched",
+		"mem.thread.title":             "threads of each program:",
+		"mem.thread.header":            "%7s  %-11s %s",
+		"mem.thread.of":                "pid %d (%s), %d threads:",
+		"mem.thread.none":              "pid %d (%s) has no listable thread",
 	},
 }

@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 #
-# GYhost 多平台构建脚本 —— 与 Makefile 配套的一键发布构建
+# GYhost 多平台构建脚本 —— 与 CMakeLists.txt 配套的一键发布构建
 #
 # 用法:
 #   ./build.sh                  # 构建全部可构建目标（无 GPU 全平台 + 本机可编的 GPU）
 #   ./build.sh nogpu            # 只构建无 GPU 版本
 #   ./build.sh gpu              # 只构建带 GPU 版本
-#   ./build.sh clean            # 清理 dist/ 与 CUDA 中间产物
+#   ./build.sh clean            # 清理 dist/、CMake 构建目录与 CUDA 中间产物
+#
+# 实现说明: 每个目标都走 CMake（见 CMakeLists.txt）配置+构建，脚本只决定编哪些。
+#   * 无 GPU 目标: 每目标一个 build-dist/<goos>-<goarch>/ 目录
+#   * GPU 目标   : 复用 build-cuda/，避免重复编译 cuda.cu
+#   * 构建日志   : build-dist/<目标>.log 与 build-cuda.log，失败时查看
 #
 # 可选架构过滤（第 2 个参数，按产物标签匹配）:
 #   ./build.sh nogpu amd64      # 仅 windows/linux/macos 的 amd64
@@ -28,6 +33,9 @@
 #     要出这些产物，请在对应平台（Windows 需装 CUDA Toolkit + MinGW/MSYS2）上运行本脚本。
 #   * Termux 目标为 android/arm64，纯 Go 静态二进制可直接在 Termux 中运行；
 #     如需 cgo DNS 解析，需改用 Android NDK 交叉编译（本脚本默认走纯 Go 解析器）。
+#   * Termux 与 Windows 产物不含 proc 模块（约束见 modules/proc）：
+#     Android 的 /proc 受限、Windows 走 WMI，都用不上进程分析。
+#     这两个目标下 gyhost proc 会提示未知模块——本就没有此功能。
 #
 set -euo pipefail
 
@@ -98,41 +106,76 @@ match_filter() {
 }
 
 # build_one 标签 GOOS GOARCH 是否GPU(0/1)
+#
+# 每个目标走一次独立的 CMake 配置+构建，产物直接落到 dist/。
+# 「交叉编译用什么参数」完全由 CMakeLists.txt 定义（GYHOST_TARGET_OS/ARCH、
+# GYHOST_OUTPUT、GYHOST_TRIMPATH），脚本只负责决定「编哪些目标」，
+# 两边不会各自维护一套参数而漂移。
 build_one() {
 	local label="$1" goos="$2" goarch="$3" gpu="$4"
-	local ext="" suffix="" cgo=0
+	local ext="" suffix="" gmode="OFF"
 	[ "$goos" = "windows" ] && ext=".exe"
-	[ "$gpu" = "1" ] && suffix="-gpu"
+	[ "$gpu" = "1" ] && { suffix="-gpu"; gmode="ON"; }
 
 	local out="$DIST/${BIN}-v${VERSION}-${label}${suffix}${ext}"
-	local -a envs args
-
+	# 每个目标一个构建目录：GOOS/GOARCH 是 CMake 缓存变量，
+	# 复用同一个目录会在目标切换时沿用上次的值。
+	#
+	# GPU 目标例外：CUDA 静态库始终是本机目标，且已在 build-cuda 里编过一遍。
+	# 若这里再用一个新目录，CMake 会把 129KB 的 cuda.cu 重编一次（纯浪费）。
+	# 所以 GPU 目标直接复用 build-cuda，让 CMake 的增量判断跳过重编。
+	local bdir log
 	if [ "$gpu" = "1" ]; then
-		cgo=1
-		envs=(CGO_ENABLED=1 GOOS="$goos" GOARCH="$goarch")
-		args=(-tags cuda -trimpath -o "$out" .)
+		bdir="${ROOT}/build-cuda"
 	else
-		envs=(CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch")
-		args=(-trimpath -o "$out" .)
+		bdir="${ROOT}/build-dist/${goos}-${goarch}"
+	fi
+	log="$bdir.log"
+
+	# 目标路径的父目录必须先建：shell 的 `> "$log"` 不会自动创建目录，
+	# 而 cmake -B 自己创建的是构建目录，日志写在它外面。
+	mkdir -p "$(dirname "$out")" "$(dirname "$log")"
+
+	info "构建 ${label}${suffix}  (GOOS=${goos} GOARCH=${goarch} GPU=${gmode})"
+
+	if ! cmake -S "$ROOT" -B "$bdir" \
+		-DGYHOST_GPU="$gmode" \
+		-DGYHOST_BUILD_TESTS=OFF \
+		-DGYHOST_TARGET_OS="$goos" \
+		-DGYHOST_TARGET_ARCH="$goarch" \
+		-DGYHOST_OUTPUT="$out" \
+		-DGYHOST_TRIMPATH=ON > "$log" 2>&1
+	then
+		err "CMake 配置失败: ${label}${suffix}（详见 ${bdir}.log）"
+		FAILED=$((FAILED + 1))
+		return
 	fi
 
-	info "构建 ${label}${suffix}  (GOOS=${goos} GOARCH=${goarch} CGO_ENABLED=${cgo})"
-	if env "${envs[@]}" go build "${args[@]}"; then
+	if cmake --build "$bdir" --target release >> "$log" 2>&1; then
 		ok "$(basename "$out")  $(du -h "$out" | cut -f1)"
 		BUILT=$((BUILT + 1))
 	else
-		err "构建失败: ${label}${suffix}"
+		err "构建失败: ${label}${suffix}（详见 ${bdir}.log）"
 		FAILED=$((FAILED + 1))
 	fi
 }
 
 # ensure_cuda_lib 按需编译一次 CUDA 静态库
+#
+# 走 CMake 而非 make（构建系统已从 Makefile 迁移到 CMakeLists.txt）。
+# 用一个独立的构建目录，与用户自己的 cmake -B build 互不干扰。
 ensure_cuda_lib() {
 	[ "$CUDA_LIB_READY" = "1" ] && return 0
 	command -v nvcc >/dev/null 2>&1 || { warn "未找到 nvcc，无法构建 CUDA 静态库"; return 1; }
-	command -v make >/dev/null 2>&1 || { warn "未找到 make，无法构建 CUDA 静态库"; return 1; }
-	info "编译 CUDA 静态库: make -C ${CUDA_DIR}"
-	make -C "$CUDA_DIR" || { err "CUDA 静态库编译失败"; return 1; }
+	command -v cmake >/dev/null 2>&1 || { warn "未找到 cmake，无法构建 CUDA 静态库"; return 1; }
+	local bdir="${ROOT}/build-cuda"
+	info "编译 CUDA 静态库: cmake --build ${bdir} --target gyhost_cuda"
+	cmake -S "${ROOT}" -B "${bdir}" -DGYHOST_GPU=ON \
+		-DGYHOST_BUILD_TESTS=OFF \
+		-DGYHOST_CUDA_ARCH="${GYHOST_CUDA_ARCH:-native}" >/dev/null 2>&1 \
+		|| { err "CMake 配置失败"; return 1; }
+	cmake --build "${bdir}" --target gyhost_cuda \
+		|| { err "CUDA 静态库编译失败"; return 1; }
 	CUDA_LIB_READY=1
 }
 
@@ -166,8 +209,13 @@ run_gpu() {
 
 clean() {
 	rm -rf "$DIST"
-	command -v make >/dev/null 2>&1 && make -C "$CUDA_DIR" clean || true
-	ok "已清理 ${DIST} 与 CUDA 中间产物"
+	# CMake 构建目录：每个交叉目标一个，外加本机 GPU 库目录。
+	rm -rf "${ROOT}/build-dist" "${ROOT}/build-cuda"
+	# 构建日志（每个目标一个，写在构建目录旁边）
+	rm -f "${ROOT}"/*.log
+	# CUDA 静态库落在 internal/cuda（cgo 的 -L${SRCDIR} 要求），需单独删。
+	rm -f "${CUDA_DIR}/cuda.o" "${CUDA_DIR}/libgyhost_cuda.a"
+	ok "已清理 ${DIST}、CMake 构建目录与 CUDA 中间产物"
 }
 
 # ---------------------------------------------------------------- 入口
@@ -179,6 +227,9 @@ case "$MODE" in
 esac
 
 mkdir -p "$DIST"
+
+command -v cmake >/dev/null 2>&1 || { err "未找到 cmake，请先安装 CMake 3.24+"; exit 1; }
+
 info "GYhost v${VERSION}  主机: ${HOST_OS}/${HOST_ARCH}  产物目录: ${DIST}"
 [ -n "$FILTER" ] && info "架构过滤: ${FILTER}"
 
