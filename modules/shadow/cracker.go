@@ -28,6 +28,7 @@ type Options struct {
 	OutputPath   string   // 可选，结果输出文件
 	Users        []string // 可选，只爆破这些用户；空表示全部
 	GPU          bool     // 可选，尝试用 GPU (CUDA) 加速；不可用时提示并回退 CPU
+	GPUYescrypt  bool     // 可选，把 $y$ yescrypt 目标也交给 GPU（默认留给 CPU）
 
 	// Progress 实时进度输出目标（通常为 os.Stderr）；nil 表示不显示进度。
 	Progress io.Writer
@@ -75,6 +76,10 @@ type target struct {
 	// gpu 该目标在 GPU 上校验所需的参数；nil 表示只能走 CPU。
 	// 仅在请求了 --gpu 时填充，读写均发生在爆破开始前的规划阶段。
 	gpu *cuda.Target
+
+	// ygpu yescrypt($y$) 目标在 GPU 上校验所需的参数；nil 表示不走 GPU。
+	// 仅在请求了 --gpu 时填充，读写均发生在爆破开始前的规划阶段。
+	ygpu *cuda.YescryptTarget
 
 	cracked  atomic.Bool
 	attempts atomic.Int64
@@ -129,6 +134,27 @@ type session struct {
 	checked   atomic.Int64 // 字典中已消费的候选密码数
 	resultsMu sync.Mutex
 	results   []Result
+}
+
+// dictProgress 返回整场的字典枚举进度：所有待破解目标里最慢的那个已扫过的候选数。
+//
+// 每个目标都得把整个字典扫一遍，所以整场进度由最慢的目标决定。
+// 旧实现是「谁先拿到批次谁推进字典计数」，快的目标（比如 $5$/$6$）会把进度
+// 直接推到 100%，而慢的 $y$ 目标其实才跑了一小段——进度条因此完全失真。
+//
+// 返回 -1 表示所有目标都已破解（字典进度按完成计）。
+func (s *session) dictProgress() int64 {
+	min := int64(-1)
+	for _, t := range s.targets {
+		if t.cracked.Load() {
+			continue // 已破解，不用再扫后面的字典
+		}
+		a := t.attempts.Load()
+		if min < 0 || a < min {
+			min = a
+		}
+	}
+	return min
 }
 
 // hit 记录一次命中（并发安全）：登记结果、打印、必要时立即收工。
@@ -208,6 +234,15 @@ func Crack(opts Options) (*Report, error) {
 			if gp, ok := gpuTarget(encoded); ok {
 				t.gpu = &gp
 			}
+			// $y$ yescrypt 默认**不**上 GPU：它是内存硬算法，每个候选要独占
+			// 十几 MiB 显存（16·N·r 字节），GPU 能同时校验的候选数很少，
+			// 小显存卡上远不如多核 CPU（实测 4 GB 卡约 31 H/s，16 核 CPU 约 283 H/s）。
+			// 需要时可显式加 --gpu-yescrypt（大显存卡上才可能划算）。
+			if opts.GPUYescrypt {
+				if yp, ok := yescryptTarget(encoded); ok {
+					t.ygpu = &yp
+				}
+			}
 		}
 		targets = append(targets, t)
 	}
@@ -224,6 +259,10 @@ func Crack(opts Options) (*Report, error) {
 	}
 	defer src.Close()
 	report.Masked = maskExpr != nil
+
+	// 候选总数：掩码的 keyspace 是精确已知的；字典文件要读一遍文件才知道行数，
+	// 大字典读完之前进度行只显示已枚举数量。
+	total := newTotalTracker(opts, maskExpr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -242,7 +281,8 @@ func Crack(opts Options) (*Report, error) {
 		start:    start,
 		targets:  targets,
 		masked:   maskExpr != nil,
-		dictRead: s.checked.Load,
+		dictRead: s.dictProgress,
+		total:    total.get,
 		attempts: func() int64 {
 			var n int64
 			for _, t := range targets {
@@ -323,13 +363,28 @@ func gpuTarget(encoded string) (cuda.Target, bool) {
 	return t, true
 }
 
+// yescryptTarget 把 $y$ 编码哈希转换成 GPU 校验参数。
+// 格式不支持或参数非法时返回 false，该目标留在 CPU。
+func yescryptTarget(encoded string) (cuda.YescryptTarget, bool) {
+	p, ok := pwdhash.ParseYescrypt(encoded)
+	if !ok {
+		return cuda.YescryptTarget{}, false
+	}
+	t := cuda.YescryptTarget{NLog2: p.NLog2, R: p.R, Salt: p.Salt, Key: p.Key}
+	if err := t.Validate(); err != nil {
+		return cuda.YescryptTarget{}, false
+	}
+	return t, true
+}
+
 // gpuPlan GPU / CPU 的分工方案。
 type gpuPlan struct {
 	enabled bool      // 是否真正启用 GPU
 	device  int       // 使用的设备编号
 	name    string    // 设备名（写入报告）
 	memory  int64     // 显存（MB，写入报告）
-	gpu     []*target // 交给 GPU 的目标
+	gpu     []*target // 交给 GPU 的 crypt 目标（$1$/$5$/$6$）
+	ygpu    []*target // 交给 GPU 的 yescrypt 目标（$y$）
 	cpu     []*target // 只能走 CPU 的目标
 }
 
@@ -343,18 +398,21 @@ func (s *session) planGPU() *gpuPlan {
 		return all
 	}
 
-	var gpuT, cpuT []*target
+	var gpuT, ygpuT, cpuT []*target
 	for _, t := range s.targets {
-		if t.gpu != nil {
+		switch {
+		case t.gpu != nil:
 			gpuT = append(gpuT, t)
-		} else {
+		case t.ygpu != nil:
+			ygpuT = append(ygpuT, t)
+		default:
 			cpuT = append(cpuT, t)
 		}
 	}
 
 	// 先看“有没有值得上 GPU 的目标”，这样提示与当前构建/硬件无关、稳定可预期
-	if len(gpuT) == 0 {
-		// 目标全是 bcrypt/yescrypt 等不支持 GPU 的算法
+	if len(gpuT) == 0 && len(ygpuT) == 0 {
+		// 目标全是 bcrypt 等不支持 GPU 的算法
 		s.notice(NoticeWarn, i18n.T("shadow.gpu.unsupported"))
 		return all
 	}
@@ -374,15 +432,22 @@ func (s *session) planGPU() *gpuPlan {
 
 	s.notice(NoticeOK, i18n.Tf("shadow.gpu.enabled", dev.Name, dev.MemoryMB))
 	if len(cpuT) > 0 {
-		s.notice(NoticeInfo, i18n.Tf("shadow.gpu.partial", len(gpuT), len(cpuT)))
+		s.notice(NoticeInfo, i18n.Tf("shadow.gpu.partial", len(gpuT)+len(ygpuT), len(cpuT)))
 	}
 
 	// 唤醒显卡：空载时 GPU 处于低功耗档（P8，核心频率几百 MHz），驱动只对
 	// 持续负载提频。先用第一个 GPU 目标打满一小段时间把频率拉起来，
 	// 否则整场爆破都会跑在低档上（表现为掉速、远低于 hashcat）。
 	s.notice(NoticeInfo, i18n.Tf("shadow.gpu.warmup", cuda.WarmUpDuration))
-	if err := cuda.WarmUp(*gpuT[0].gpu, dev.Index, cuda.WarmUpDuration); err != nil {
-		s.notice(NoticeWarn, i18n.Tf("shadow.gpu.runtime_error", err))
+	var warmErr error
+	switch {
+	case len(gpuT) > 0:
+		warmErr = cuda.WarmUp(*gpuT[0].gpu, dev.Index, cuda.WarmUpDuration)
+	case len(ygpuT) > 0:
+		warmErr = cuda.WarmUpYescrypt(*ygpuT[0].ygpu, dev.Index, cuda.WarmUpDuration)
+	}
+	if warmErr != nil {
+		s.notice(NoticeWarn, i18n.Tf("shadow.gpu.runtime_error", warmErr))
 		return all
 	}
 
@@ -392,6 +457,7 @@ func (s *session) planGPU() *gpuPlan {
 		name:    dev.Name,
 		memory:  dev.MemoryMB,
 		gpu:     gpuT,
+		ygpu:    ygpuT,
 		cpu:     cpuT,
 	}
 }
@@ -412,6 +478,49 @@ func openSource(opts Options) (mask.Source, *mask.Mask, error) {
 		return nil, nil, fmt.Errorf("%s: %w", i18n.T("shadow.err.open_dict"), err)
 	}
 	return mask.NewFileSource(f), nil, nil
+}
+
+// totalTracker 跟踪候选来源的总数（字典行数或掩码 keyspace）。
+//
+// 总数用于渲染进度行里的百分比与剩余时间。掩码的 keyspace 一开始就是精确的；
+// 字典文件的行数必须读完整个文件才知道，大字典读完之前总数视为未知，
+// 因此另开一个文件句柄放到后台去数，不耽误开跑。
+type totalTracker struct {
+	n  atomic.Uint64 // 候选总数
+	ok atomic.Bool   // 总数是否已知
+}
+
+// newTotalTracker 构造总数跟踪器并启动统计。
+func newTotalTracker(opts Options, m *mask.Mask) *totalTracker {
+	t := &totalTracker{}
+	if m != nil {
+		// keyspace 溢出饱和时不是精确值，当作未知处理
+		if !m.Saturated() {
+			t.n.Store(m.Keyspace())
+			t.ok.Store(true)
+		}
+		return t
+	}
+	if opts.WordlistPath == "" {
+		return t
+	}
+	go func() {
+		n, err := mask.CountLines(opts.WordlistPath)
+		if err != nil || n <= 0 {
+			return
+		}
+		t.n.Store(uint64(n))
+		t.ok.Store(true)
+	}()
+	return t
+}
+
+// get 返回候选总数；第二个返回值为 false 表示总数未知。
+func (t *totalTracker) get() (uint64, bool) {
+	if t == nil || !t.ok.Load() {
+		return 0, false
+	}
+	return t.n.Load(), true
 }
 
 // keyspaceText 把 keyspace 渲染为文本；饱和时追加 "+" 表示实际更多。
@@ -503,9 +612,14 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 	const batchSize = 65536
 
 	var raw = make(chan *wordBatch, 4)
-	var gpuCh, cpuCh chan *wordBatch
+	var gpuCh, yGpuCh, cpuCh chan *wordBatch
+	// crypt 目标（$1$/$5$/$6$）与 yescrypt 目标（$y$）各走一条通道：
+	// 两者对显存与批量的要求完全不同，绑在一起会互相拖累。
 	if len(plan.gpu) > 0 {
 		gpuCh = make(chan *wordBatch, 2)
+	}
+	if len(plan.ygpu) > 0 {
+		yGpuCh = make(chan *wordBatch, 2)
 	}
 	if len(plan.cpu) > 0 {
 		cpuCh = make(chan *wordBatch, 8)
@@ -525,10 +639,17 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 	}()
 
 	// 分发：同一批候选同时投给两侧（只读共享，无需拷贝）
+	//
+	// 这里是背压点：yescrypt 的 GPU 消费远慢于其它消费者，通道满了分发协程
+	// 就会等它。整场耗本来就由最慢的目标决定（yescrypt 目标必须把整个字典
+	// 跑完），所以这不会拉长总时长，只是让其它消费者跟着一起等。
 	go func() {
 		defer func() {
 			if gpuCh != nil {
 				close(gpuCh)
+			}
+			if yGpuCh != nil {
+				close(yGpuCh)
 			}
 			if cpuCh != nil {
 				close(cpuCh)
@@ -540,6 +661,13 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 				case <-ctx.Done():
 					return
 				case gpuCh <- b:
+				}
+			}
+			if yGpuCh != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case yGpuCh <- b:
 				}
 			}
 			if cpuCh != nil {
@@ -558,6 +686,13 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 		go func() {
 			defer wg.Done()
 			s.gpuLoop(ctx, gpuCh, plan)
+		}()
+	}
+	if yGpuCh != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.yescryptLoop(ctx, yGpuCh, plan)
 		}()
 	}
 	if cpuCh != nil {
@@ -594,6 +729,11 @@ func (s *session) gpuLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPl
 
 	gpuOn := true
 	fallbackNoticed := false
+	// 块大小取内核的一次发射粒度（GY_CHUNK），再小就会丢掉 GPU 并发度
+	chunk := cuda.ChunkSize()
+	if chunk < 1 {
+		chunk = chunkFallback
+	}
 
 	for b := range ch {
 		if ctx.Err() != nil {
@@ -618,13 +758,14 @@ func (s *session) gpuLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPl
 			if t.cracked.Load() {
 				continue
 			}
-			t.attempts.Add(int64(len(b.pw)))
 			if checkers[i] == nil {
 				continue
 			}
 
 			if gpuOn && len(send) > 0 {
-				idx, err := cuda.Verify(*t.gpu, send, plan.device)
+				pw, err := s.verifyChunks(t, send, chunk, func(part []string) (int, error) {
+					return cuda.Verify(*t.gpu, part, plan.device)
+				})
 				if err != nil {
 					// 本批及后续批次改由 CPU 处理，只提示一次
 					gpuOn = false
@@ -632,8 +773,8 @@ func (s *session) gpuLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPl
 						fallbackNoticed = true
 						s.notice(NoticeWarn, i18n.Tf("shadow.gpu.runtime_error", err))
 					}
-				} else if idx >= 0 {
-					s.hit(t, send[idx])
+				} else if pw != "" {
+					s.hit(t, pw)
 					continue
 				}
 			}
@@ -643,15 +784,140 @@ func (s *session) gpuLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPl
 			if !gpuOn {
 				cands = b.pw
 			}
-			for _, pw := range cands {
-				if !checkers[i].Check(pw) {
-					continue
-				}
-				s.hit(t, pw)
-				break
+			s.checkBatch(t, checkers[i], cands)
+		}
+	}
+}
+
+// yescryptLoop GPU 消费者（$y$ 目标）。
+//
+// 与 crypt 目标分开：yescrypt 每个候选要独占十几 MiB 显存，
+// 内核侧已按显存把候选分波下发，这里不需要（也不适合）多批同时在飞。
+func (s *session) yescryptLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPlan) {
+	// GPU 目标的 CPU 校验器：用于超长候选、以及 GPU 故障后的回退
+	checkers := make([]pwdhash.Checker, len(plan.ygpu))
+	for i, t := range plan.ygpu {
+		if c, err := pwdhash.NewChecker(t.encoded); err == nil {
+			checkers[i] = c
+		}
+	}
+
+	gpuOn := true
+	fallbackNoticed := false
+	// 块大小按目标各自取：yescrypt 的并发度受显存限制，
+	// 不同目标的参数（N、r）不同，能并发校验的候选数也不同。
+	chunks := make([]int, len(plan.ygpu))
+	for i, t := range plan.ygpu {
+		chunks[i] = chunkFallback
+		if t.ygpu != nil {
+			if wave, err := cuda.YescryptWaveSize(t.ygpu.NLog2, t.ygpu.R, plan.device); err == nil && wave > 0 {
+				chunks[i] = wave
 			}
 		}
 	}
+
+	for b := range ch {
+		if ctx.Err() != nil {
+			return
+		}
+		b.consume(&s.checked)
+
+		// 超过 GPU 单候选上限的密码只能由 CPU 校验
+		var send, over []string
+		for _, pw := range b.pw {
+			if len(pw) > cuda.MaxPasswordLen {
+				over = append(over, pw)
+			} else {
+				send = append(send, pw)
+			}
+		}
+
+		for i, t := range plan.ygpu {
+			if ctx.Err() != nil {
+				return
+			}
+			if t.cracked.Load() {
+				continue
+			}
+			if checkers[i] == nil {
+				continue
+			}
+
+			if gpuOn && len(send) > 0 {
+				pw, err := s.verifyChunks(t, send, chunks[i], func(part []string) (int, error) {
+					return cuda.VerifyYescrypt(*t.ygpu, part, plan.device)
+				})
+				if err != nil {
+					// 显存不够或内核出错：本批及后续批次改由 CPU 处理，只提示一次
+					gpuOn = false
+					if !fallbackNoticed {
+						fallbackNoticed = true
+						s.notice(NoticeWarn, i18n.Tf("shadow.gpu.runtime_error", err))
+					}
+				} else if pw != "" {
+					s.hit(t, pw)
+					continue
+				}
+			}
+
+			// CPU 兜底：GPU 关闭时校验整批，否则只校验超长候选
+			cands := over
+			if !gpuOn {
+				cands = b.pw
+			}
+			s.checkBatch(t, checkers[i], cands)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GPU 分块下发
+// ---------------------------------------------------------------------------
+
+// 分块下发的关键约束：**块不能小于内核一次发射的粒度**。
+//
+// 内核是「一线程一候选」，耗时由最慢的一个 warp 决定——块变小并不会更快，
+// 只把 GPU 的并发度白白扔掉（实测 yescrypt 的块从 178 降到 40，吞吐掉了 4 倍）。
+// 所以块大小直接取内核的内部粒度：
+//
+//   - crypt：一次内核发射处理 GY_CHUNK 个候选（cuda.ChunkSize）
+//   - yescrypt：一次能并发校验的候选数，受显存限制（cuda.YescryptWaveSize）
+//
+// 分块的目的只是让进度能平滑推进：一批 65536 个候选在 yescrypt 默认参数下
+// 要跑 36 分钟，计数全压在批次末尾会让进度长时间不动、速率曲线失真。
+const chunkFallback = 8192 // 拿不到内核粒度时的保守兜底
+
+// verifyChunks 把候选分块下发 GPU 校验，返回命中的密码（未命中为空串）。
+//
+// 每块校验**真正完成后**才计入目标的 attempts：进度必须反映算完的候选，
+// 否则速率会先虚高再持续下滑（整批一次性计数时的典型症状）。
+func (s *session) verifyChunks(t *target, cands []string, chunk int,
+	verify func([]string) (int, error)) (string, error) {
+	if chunk < 1 {
+		chunk = chunkFallback
+	}
+	for off := 0; off < len(cands); {
+		if t.cracked.Load() {
+			return "", nil
+		}
+		end := off + chunk
+		if end > len(cands) {
+			end = len(cands)
+		}
+		part := cands[off:end]
+
+		idx, err := verify(part)
+		if err != nil {
+			return "", err
+		}
+		t.attempts.Add(int64(len(part)))
+		off = end
+
+		if idx >= 0 {
+			return part[idx], nil
+		}
+	}
+	return "", nil
 }
 
 // gpuPipeline 单个 GPU 目标的异步流水线：若干批次同时在飞，GPU 不空等主机。
@@ -662,6 +928,11 @@ func (s *session) gpuPipeline(ctx context.Context, ch <-chan *wordBatch, plan *g
 	numSlots := cuda.PipelineSlots()
 	if numSlots < 1 {
 		numSlots = 1
+	}
+	// 每次下发的块大小取内核一次发射的粒度（GY_CHUNK）。
+	chunk := cuda.ChunkSize()
+	if chunk < 1 {
+		chunk = chunkFallback
 	}
 	type slotState struct {
 		handle int
@@ -686,9 +957,14 @@ func (s *session) gpuPipeline(ctx context.Context, ch <-chan *wordBatch, plan *g
 				fallbackNoticed = true
 				s.notice(NoticeWarn, i18n.Tf("shadow.gpu.runtime_error", err))
 			}
+			// CPU 兜底把这批也校验了一遍，计入进度
+			t.attempts.Add(int64(len(sl.sent)))
 			s.checkBatch(t, checker, sl.sent)
 			return
 		}
+		// 这一批在设备上算完了，此刻才计入进度：
+		// 提交时就计数会让速率先虚高、随后持续下滑。
+		t.attempts.Add(int64(len(sl.sent)))
 		if idx >= 0 {
 			s.hit(t, sl.sent[idx])
 		}
@@ -712,7 +988,6 @@ func (s *session) gpuPipeline(ctx context.Context, ch <-chan *wordBatch, plan *g
 		if t.cracked.Load() {
 			continue // 已破解，别再往 GPU 里喂候选
 		}
-		t.attempts.Add(int64(len(b.pw)))
 
 		// 超过 GPU 单候选上限的密码只能由 CPU 校验
 		var send, over []string
@@ -724,36 +999,58 @@ func (s *session) gpuPipeline(ctx context.Context, ch <-chan *wordBatch, plan *g
 			}
 		}
 
-		if gpuOn && len(send) > 0 {
+		// GPU 不可用：整批交给 CPU
+		if !gpuOn {
+			s.checkBatch(t, checker, b.pw)
+			continue
+		}
+
+		// 分块下发：块大小取内核一次发射的粒度。
+		//
+		// 不分块的话，一个批次 65536 个候选会整批塞进一个槽位，
+		// 8 个槽位同时在飞就是 50 多万个候选——进度要几十秒才动一次。
+		gpuSent := 0 // 已经交给 GPU 的候选数
+		for gpuSent < len(send) {
+			if t.cracked.Load() {
+				break // 已破解，不用再往 GPU 里喂候选
+			}
+			end := gpuSent + chunk
+			if end > len(send) {
+				end = len(send)
+			}
+			part := send[gpuSent:end]
+
 			// 环已满则先收最老的一批，腾出槽位（collect 可能判定 GPU 故障）
 			if slots[slotIdx] != nil {
 				collect(slots[slotIdx])
 				slots[slotIdx] = nil
 			}
-			if gpuOn {
-				h, err := cuda.VerifyAsync(*t.gpu, send, plan.device)
-				if err != nil {
-					gpuOn = false
-					if !fallbackNoticed {
-						fallbackNoticed = true
-						s.notice(NoticeWarn, i18n.Tf("shadow.gpu.runtime_error", err))
-					}
-				} else {
-					slots[slotIdx] = &slotState{handle: h, sent: send}
-					slotIdx = (slotIdx + 1) % numSlots
-					// GPU 在飞：CPU 只兜底进不了 GPU 的候选
-					s.checkBatch(t, checker, over)
-					continue
-				}
+			if !gpuOn {
+				break // collect 判定 GPU 出故障
 			}
+			h, err := cuda.VerifyAsync(*t.gpu, part, plan.device)
+			if err != nil {
+				gpuOn = false
+				if !fallbackNoticed {
+					fallbackNoticed = true
+					s.notice(NoticeWarn, i18n.Tf("shadow.gpu.runtime_error", err))
+				}
+				break
+			}
+			slots[slotIdx] = &slotState{handle: h, sent: part}
+			slotIdx = (slotIdx + 1) % numSlots
+			gpuSent = end
 		}
 
-		// GPU 关闭时整批交给 CPU；GPU 正常时只校验超长候选
-		cands := over
-		if !gpuOn {
-			cands = b.pw
+		if gpuOn {
+			// GPU 在飞：CPU 只兜底进不了 GPU 的候选（超长密码）
+			s.checkBatch(t, checker, over)
+			continue
 		}
-		s.checkBatch(t, checker, cands)
+		// GPU 中途故障：还没交给 GPU 的候选交给 CPU，
+		// 已经提交的那些由 collect 负责（出错时它也会 CPU 兜底）。
+		s.checkBatch(t, checker, send[gpuSent:])
+		s.checkBatch(t, checker, over)
 	}
 
 	collectAll()

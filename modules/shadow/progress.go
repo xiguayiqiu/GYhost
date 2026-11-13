@@ -3,6 +3,7 @@ package shadow
 import (
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -142,9 +143,10 @@ func (r *reporter) clearLocked() {
 type progressData struct {
 	start    time.Time
 	targets  []*target
-	dictRead func() int64 // 已读入的候选数（字典行数或掩码候选数）
-	attempts func() int64 // 总校验次数
-	masked   bool         // 候选来自掩码枚举
+	dictRead func() int64          // 已读入的候选数（字典行数或掩码候选数）
+	total    func() (uint64, bool) // 候选总数；第二个返回值为 false 表示总数未知
+	attempts func() int64          // 总校验次数
+	masked   bool                  // 候选来自掩码枚举
 }
 
 // maxTrying 是「尝试中」列表最多展示的目标数。
@@ -158,10 +160,10 @@ func (d progressData) line(maxCols int) string {
 	var (
 		cracked int
 		pending []string
-		total   int64
+		checks  int64
 	)
 	for _, t := range d.targets {
-		total += t.attempts.Load()
+		checks += t.attempts.Load()
 		if t.cracked.Load() {
 			cracked++
 			continue
@@ -170,7 +172,7 @@ func (d progressData) line(maxCols int) string {
 		pending = append(pending, fmt.Sprintf("%s(%s) %s",
 			utils.Warn("%s", t.user),
 			utils.Info("%s", algoLabel(t.algo)),
-			utils.Title("%s", humanCount(t.attempts.Load()))))
+			utils.Title("%s", humanCount(u64(t.attempts.Load())))))
 	}
 
 	elapsed := time.Since(d.start).Seconds()
@@ -185,12 +187,19 @@ func (d progressData) line(maxCols int) string {
 	}
 	head := i18n.Tf(headKey,
 		utils.Success("%s", i18n.Tf("shadow.progress.cracked", cracked, len(d.targets))),
-		utils.Title("%s", humanCount(d.dictRead())),
-		utils.Info("%s", humanCount(total)))
+		utils.Title("%s", d.sourceSeg()),
+		utils.Info("%s", humanCount(u64(checks))))
 
-	tail := i18n.Tf("shadow.progress.tail",
-		utils.Info("%s", i18n.Tf("shadow.progress.rate", humanRate(speed))),
-		utils.Title("%.1fs", elapsed))
+	rateTxt := utils.Info("%s", i18n.Tf("shadow.progress.rate", humanRate(speed)))
+	elapsedTxt := utils.Title("%.1fs", elapsed)
+	tailKey := "shadow.progress.tail"
+	tailArgs := []interface{}{rateTxt, elapsedTxt}
+	if eta, ok := d.etaSec(); ok {
+		// 总数已知时多给一个「剩余时间」，比光看已枚举数量更知道还要等多久
+		tailKey = "shadow.progress.tail_eta"
+		tailArgs = []interface{}{rateTxt, utils.Warn("%s", i18n.Tf("shadow.progress.eta", humanDuration(eta))), elapsedTxt}
+	}
+	tail := i18n.Tf(tailKey, tailArgs...)
 
 	mid := " " + i18n.T("shadow.progress.finished")
 	if len(pending) > 0 {
@@ -198,6 +207,70 @@ func (d progressData) line(maxCols int) string {
 		mid = fitTrying(pending, maxCols, utils.VisibleLen(head)+1+utils.VisibleLen(tail))
 	}
 	return utils.TruncateVisible(head+mid+" "+tail, maxCols)
+}
+
+// sourceSeg 渲染「字典/掩码」片段：已枚举数量 + 总数 + 完成百分比。
+//
+// read 是「所有待破解目标都已扫过」的候选数（由最慢的目标决定），
+// -1 表示全部目标已破解。
+//
+// 总数未知时只显示已枚举数量——字典文件的总行数要读完整个文件才知道，
+// 在后台数完之前这里拿不到精确值。
+func (d progressData) sourceSeg() string {
+	read := d.dictRead()
+	total, known := uint64(0), false
+	if d.total != nil {
+		total, known = d.total()
+	}
+	if read < 0 {
+		// 全部目标已破解：字典进度按完成计
+		if known && total > 0 {
+			return fmt.Sprintf("%s/%s (100.0%%)", humanCount(total), humanCount(total))
+		}
+		return "100%"
+	}
+	seg := humanCount(u64(read))
+	if !known || total == 0 {
+		return seg
+	}
+	// 读数超过总数说明字典被改动过，百分比按 100% 封顶
+	pct := float64(read) / float64(total) * 100
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("%s/%s (%.1f%%)", seg, humanCount(total), pct)
+}
+
+// etaSec 估算枚举完整个候选源还需多久（秒）。
+//
+// 第二个返回值为 false 表示算不出来（总数未知、还没开始或速率为零）。
+func (d progressData) etaSec() (float64, bool) {
+	if d.total == nil {
+		return 0, false
+	}
+	total, ok := d.total()
+	if !ok || total == 0 {
+		return 0, false
+	}
+	read := d.dictRead()
+	if read < 0 {
+		return 0, true // 已经枚举完了
+	}
+	if read <= 0 {
+		return 0, false
+	}
+	if u64(read) >= total {
+		return 0, true // 已经枚举完了
+	}
+	elapsed := time.Since(d.start).Seconds()
+	if elapsed <= 0 {
+		return 0, false
+	}
+	rate := float64(read) / elapsed // 候选/秒
+	if rate <= 0 {
+		return 0, false
+	}
+	return float64(total-u64(read)) / rate, true
 }
 
 // fitTrying 拼出「尝试中」片段，最多展示 maxTrying 个目标。
@@ -212,7 +285,7 @@ func fitTrying(pending []string, maxCols, used int) string {
 	for n := limit; n >= 1; n-- {
 		suffix := ""
 		if n < len(pending) {
-			suffix = i18n.Tf("shadow.progress.more", humanCount(int64(len(pending))))
+			suffix = i18n.Tf("shadow.progress.more", humanCount(uint64(len(pending))))
 		}
 		seg := " " + i18n.Tf("shadow.progress.trying", strings.Join(pending[:n], ", ")+suffix)
 		if maxCols <= 0 || used+utils.VisibleLen(seg) <= maxCols {
@@ -247,14 +320,55 @@ func algoLabel(algo string) string {
 	return algo
 }
 
-// humanCount 把数字压缩成 1.2k / 3.4M 形式。
-func humanCount(n int64) string {
+// humanCount 把数字压缩成 1.2k / 3.4M / 5.6G 形式。
+func humanCount(n uint64) string {
 	switch {
-	case n >= 1_000_000:
-		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
-	case n >= 1_000:
-		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	case n >= 1e18:
+		return fmt.Sprintf("%.1fE", float64(n)/1e18)
+	case n >= 1e15:
+		return fmt.Sprintf("%.1fP", float64(n)/1e15)
+	case n >= 1e12:
+		return fmt.Sprintf("%.1fT", float64(n)/1e12)
+	case n >= 1e9:
+		return fmt.Sprintf("%.1fG", float64(n)/1e9)
+	case n >= 1e6:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	case n >= 1e3:
+		return fmt.Sprintf("%.1fk", float64(n)/1e3)
 	default:
 		return fmt.Sprintf("%d", n)
+	}
+}
+
+// u64 把计数器转成无符号数；负数（不该出现）按 0 处理。
+func u64(n int64) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
+
+// humanDuration 把时长渲染成 45秒 / 12分 / 1时23分 / 2天3时 形式。
+//
+// 分钟及以上四舍五入而不是截断：截断会把「还剩 1分56秒」显示成「1分」，
+// 少报将近一分钟，看着比实际乐观。
+func humanDuration(sec float64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	d := time.Duration(sec * float64(time.Second))
+	switch {
+	case d < time.Minute:
+		return i18n.Tf("shadow.progress.dur.sec", int(d.Seconds()))
+	case d < time.Hour:
+		return i18n.Tf("shadow.progress.dur.min", int(math.Round(d.Minutes())))
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		m := int(d.Minutes()) - h*60
+		return i18n.Tf("shadow.progress.dur.hour", h, m)
+	default:
+		days := int(d.Hours()) / 24
+		h := int(d.Hours()) % 24
+		return i18n.Tf("shadow.progress.dur.day", days, h)
 	}
 }

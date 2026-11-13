@@ -9,6 +9,7 @@
 package pwdhash
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -44,9 +45,24 @@ func NewChecker(encodedHash string) (Checker, error) {
 		return nil, errors.New(i18n.T("pwdhash.err.empty"))
 	}
 
-	// yescrypt 由 go-crypt/x 单独提供（按 setting 重新计算并整体比较）。
-	if strings.HasPrefix(h, "$y$") || strings.HasPrefix(h, "$7$") {
-		return &yescryptChecker{encoded: h}, nil
+	// yescrypt 由 go-crypt/x 单独提供（参数与盐预先解码，逐候选只做重算）。
+	if strings.HasPrefix(h, "$y$") {
+		p, ok := ParseYescrypt(h)
+		if !ok {
+			return nil, fmt.Errorf("%s: %w", i18n.Tf("pwdhash.err.unsupported", AlgoOf(h)), errUnsupported)
+		}
+		return &yescryptChecker{
+			nlog2: p.NLog2,
+			r:     p.R,
+			salt:  p.Salt,
+			key:   p.Key,
+		}, nil
+	}
+
+	// $7$ 是 scrypt-crypt 格式，go-crypt/x/yescrypt 不支持；
+	// 与其在这里「假装支持、实际永远不匹配」，不如明确报不支持。
+	if strings.HasPrefix(h, "$7$") {
+		return nil, fmt.Errorf("%s: %w", i18n.Tf("pwdhash.err.unsupported", AlgoOf(h)), errUnsupported)
 	}
 
 	digest, err := newDecoder().Decode(h)
@@ -55,6 +71,9 @@ func NewChecker(encodedHash string) (Checker, error) {
 	}
 	return &digestChecker{digest: digest, algo: AlgoOf(h)}, nil
 }
+
+// errUnsupported 表示哈希格式/参数不被支持。
+var errUnsupported = errors.New(i18n.T("pwdhash.err.unsupported_detail"))
 
 // AlgoOf 从编码哈希中提取算法标识，例如 "$6$rounds=5000$salt$key" -> "6"。
 func AlgoOf(encodedHash string) string {
@@ -110,20 +129,18 @@ func (c *digestChecker) Check(password string) bool {
 func (c *digestChecker) Algo() string { return c.algo }
 
 type yescryptChecker struct {
-	encoded string
+	nlog2 int    // N = 1<<nlog2
+	r     int    // 块大小因子
+	salt  []byte // 解码后的盐
+	key   []byte // 目标派生密钥
 }
 
 func (c *yescryptChecker) Check(password string) bool {
-	out, err := yescrypt.Hash([]byte(password), []byte(c.encoded))
+	dk, err := yescrypt.Key([]byte(password), c.salt, 1<<c.nlog2, c.r, 1, yescryptKeyLen)
 	if err != nil {
 		return false
 	}
-	return string(out) == c.encoded
+	return bytes.Equal(dk, c.key)
 }
 
-func (c *yescryptChecker) Algo() string {
-	if strings.HasPrefix(c.encoded, "$7$") {
-		return "scrypt-crypt"
-	}
-	return "yescrypt"
-}
+func (c *yescryptChecker) Algo() string { return "yescrypt" }

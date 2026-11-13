@@ -112,7 +112,7 @@ type target struct {
 //   - 7z 的 LZMA/Deflate 条目：内核只能校验 Copy 编码器（需要解压）；
 //   - 密文超过 GPU 上限（WinZip AES / 7z 都要整段下发）。
 func gpuNote(t *Target) string {
-	if t == nil || t.GPU != nil {
+	if t == nil || t.GPU != nil || t.YGPU != nil {
 		return ""
 	}
 	switch c := t.Check.(type) {
@@ -131,16 +131,38 @@ func gpuNote(t *Target) string {
 }
 
 // wordBatch 一批候选密码；同一批会同时投递给 GPU 与 CPU 消费者，
-// once 保证「字典消耗」只计一次。
+// consumed 保证「字典消耗」只按实际处理过的候选计一次（见 consumeN）。
 type wordBatch struct {
-	pw   []string
-	once atomic.Bool
+	pw       []string
+	consumed atomic.Int64
 }
 
-// consume 计入字典消耗（每批至多一次）。
-func (b *wordBatch) consume(dst *atomic.Int64) {
-	if b.once.CompareAndSwap(false, true) {
-		dst.Add(int64(len(b.pw)))
+// consume 计入整批字典消耗（每批至多一次）。
+func (b *wordBatch) consume(dst *atomic.Int64) { b.consumeN(dst, len(b.pw)) }
+
+// consumeN 计入本批前 n 个候选的字典消耗。
+//
+// 慢速消费者（yescrypt）会把一批拆成多波处理，每波算完才推进进度；
+// 快消费者可能一次性吞掉整批。用 CAS 把累计值封顶在 len(pw)，
+// 这样无论谁先消费、拆成几次，字典进度都只记一次、且不超过真实行数。
+func (b *wordBatch) consumeN(dst *atomic.Int64, n int) {
+	if n <= 0 {
+		return
+	}
+	total := int64(len(b.pw))
+	for {
+		cur := b.consumed.Load()
+		if cur >= total {
+			return
+		}
+		end := cur + int64(n)
+		if end > total {
+			end = total
+		}
+		if b.consumed.CompareAndSwap(cur, end) {
+			dst.Add(end - cur)
+			return
+		}
 	}
 }
 
@@ -325,7 +347,10 @@ type gpuPlan struct {
 	device  int
 	name    string
 	memory  int64
-	gpu     []*target
+	gpu     []*target // 通用 GPU 内核目标
+	ygpu    []*target // yescrypt（$y$）目标，走独立的显存受限路径
+	// yChunks 与 ygpu 一一对应：每个目标一次下发的候选数（取 YescryptWaveSize）。
+	yChunks []int
 	cpu     []*target
 }
 
@@ -336,11 +361,14 @@ func (s *session) planGPU(targets []*target) *gpuPlan {
 		return all
 	}
 
-	var gpuT, cpuT []*target
+	var gpuT, yGpuT, cpuT []*target
 	for _, t := range targets {
-		if t.t.GPU != nil {
+		switch {
+		case t.t.YGPU != nil:
+			yGpuT = append(yGpuT, t)
+		case t.t.GPU != nil:
 			gpuT = append(gpuT, t)
-		} else {
+		default:
 			cpuT = append(cpuT, t)
 		}
 	}
@@ -352,7 +380,7 @@ func (s *session) planGPU(targets []*target) *gpuPlan {
 			s.notice(NoticeInfo, t.note)
 		}
 	}
-	if len(gpuT) == 0 {
+	if len(gpuT) == 0 && len(yGpuT) == 0 {
 		s.notice(NoticeWarn, i18n.T("hashac.gpu.unsupported"))
 		return all
 	}
@@ -372,16 +400,41 @@ func (s *session) planGPU(targets []*target) *gpuPlan {
 
 	s.notice(NoticeOK, i18n.Tf("hashac.gpu.enabled", dev.Name, dev.MemoryMB))
 	if len(cpuT) > 0 {
-		s.notice(NoticeInfo, i18n.Tf("hashac.gpu.partial", len(gpuT), len(cpuT)))
+		s.notice(NoticeInfo, i18n.Tf("hashac.gpu.partial", len(gpuT)+len(yGpuT), len(cpuT)))
 	}
 
 	// 唤醒显卡：空载时 GPU 停在低功耗档（P8，核心频率几百 MHz），驱动只对
-	// 持续负载提频。先用第一个 GPU 目标打满一小段时间把频率拉起来，
+	// 持续负载提频。先用真实目标打满一小段时间把频率拉起来，
 	// 否则整场爆破都跑在低档上（表现为掉速、远低于 hashcat）。
 	s.notice(NoticeInfo, i18n.Tf("hashac.gpu.warmup", cuda.WarmUpDuration))
-	if err := cuda.WarmUpHash(*gpuT[0].t.GPU, dev.Index, cuda.WarmUpDuration); err != nil {
-		s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
+	if len(gpuT) > 0 {
+		if err := cuda.WarmUpHash(*gpuT[0].t.GPU, dev.Index, cuda.WarmUpDuration); err != nil {
+			s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
+			cpuT = append(gpuT, cpuT...)
+			gpuT = nil
+		}
+	}
+	if len(yGpuT) > 0 {
+		if err := cuda.WarmUpYescrypt(*yGpuT[0].t.YGPU, dev.Index, cuda.WarmUpDuration); err != nil {
+			s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
+			cpuT = append(yGpuT, cpuT...)
+			yGpuT = nil
+		}
+	}
+	if len(gpuT) == 0 && len(yGpuT) == 0 {
 		return all
+	}
+
+	// yescrypt 的并发度由显存决定：块大小取内核一次能并发的候选数。
+	// 块小于它就是拿掉 GPU 并发度（内核「一线程一候选」，耗时由最慢的
+	// warp 决定，块变小并不会更快）。
+	chunks := make([]int, len(yGpuT))
+	for i, t := range yGpuT {
+		chunk := hashacYescryptChunkFallback
+		if wave, err := cuda.YescryptWaveSize(t.t.YGPU.NLog2, t.t.YGPU.R, dev.Index); err == nil && wave > 0 {
+			chunk = wave
+		}
+		chunks[i] = chunk
 	}
 
 	return &gpuPlan{
@@ -390,6 +443,8 @@ func (s *session) planGPU(targets []*target) *gpuPlan {
 		name:    dev.Name,
 		memory:  dev.MemoryMB,
 		gpu:     gpuT,
+		ygpu:    yGpuT,
+		yChunks: chunks,
 		cpu:     cpuT,
 	}
 }
@@ -478,9 +533,14 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 	const batchSize = 131072
 
 	raw := make(chan *wordBatch, 4)
-	var gpuCh, cpuCh chan *wordBatch
+	var gpuCh, yGpuCh, cpuCh chan *wordBatch
+	// 通用 GPU 目标与 yescrypt（$y$）目标各走一条通道：两者对显存、
+	// 批量与流水线的要求完全不同，绑在一起会互相拖累。
 	if len(plan.gpu) > 0 {
 		gpuCh = make(chan *wordBatch, 2)
+	}
+	if len(plan.ygpu) > 0 {
+		yGpuCh = make(chan *wordBatch, 2)
 	}
 	if len(plan.cpu) > 0 {
 		cpuCh = make(chan *wordBatch, 8)
@@ -565,6 +625,9 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 			if gpuCh != nil {
 				close(gpuCh)
 			}
+			if yGpuCh != nil {
+				close(yGpuCh)
+			}
 			if cpuCh != nil {
 				close(cpuCh)
 			}
@@ -575,6 +638,13 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 				case <-ctx.Done():
 					return
 				case gpuCh <- b:
+				}
+			}
+			if yGpuCh != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case yGpuCh <- b:
 				}
 			}
 			if cpuCh != nil {
@@ -593,6 +663,13 @@ func (s *session) runMixed(ctx context.Context, src mask.Source, plan *gpuPlan, 
 		go func() {
 			defer wg.Done()
 			s.gpuLoop(ctx, gpuCh, plan)
+		}()
+	}
+	if yGpuCh != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.yescryptLoop(ctx, yGpuCh, plan)
 		}()
 	}
 	if cpuCh != nil {
@@ -798,6 +875,147 @@ func (s *session) gpuLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPl
 
 	// 通道关闭，收所有在飞批次的结果
 	collectAll()
+}
+
+// hashacYescryptChunkFallback 是拿不到内核并发度时的保守块大小。
+//
+// 块不能太小：yescrypt 内核是「一线程一候选」，耗时由最慢的一个 warp 决定，
+// 块小于显存能容纳的候选数并不会更快，只会把并发度白白扔掉。
+const hashacYescryptChunkFallback = 256
+
+// yescryptLoop GPU 消费者（$y$ 目标）。
+//
+// 与通用 GPU 内核分开：yescrypt 每个候选要独占一块 16·N·r 字节的 v 数组
+// （libxcrypt 默认参数约 16 MiB），因此不能像快哈希那样多批同时在飞。
+// 这里按显存能容纳的候选数分波下发，每波真正算完才推进进度；
+// 波大小低于内核并发度会让吞吐掉好几倍（实测 178→40 掉到四分之一）。
+func (s *session) yescryptLoop(ctx context.Context, ch <-chan *wordBatch, plan *gpuPlan) {
+	gpuOn := true
+	fallbackNoticed := false
+
+	for b := range ch {
+		if ctx.Err() != nil {
+			return
+		}
+
+		// 超过 GPU 单候选上限的密码只能由 CPU 校验
+		var send, over []string
+		for _, pw := range b.pw {
+			if len(pw) > cuda.MaxPasswordLen {
+				over = append(over, pw)
+			} else {
+				send = append(send, pw)
+			}
+		}
+
+		for i, t := range plan.ygpu {
+			if ctx.Err() != nil {
+				return
+			}
+			if t.cracked.Load() {
+				continue
+			}
+			chunk := hashacYescryptChunkFallback
+			if i < len(plan.yChunks) && plan.yChunks[i] > 0 {
+				chunk = plan.yChunks[i]
+			}
+
+			if gpuOn && len(send) > 0 {
+				if err := s.verifyYescryptChunks(ctx, b, t, send, chunk, plan.device); err != nil {
+					// 显存不够或内核出错：本批剩余候选已由 verifyYescryptChunks
+					// 交给 CPU，后续批次也改走 CPU，只提示一次
+					gpuOn = false
+					if !fallbackNoticed {
+						fallbackNoticed = true
+						s.notice(NoticeWarn, i18n.Tf("hashac.gpu.runtime_error", err))
+					}
+				}
+			} else if !gpuOn && len(send) > 0 {
+				s.checkBatchCounted(b, t, send)
+			}
+
+			// 超长候选始终由 CPU 校验（每波 GPU 都校验不了的候选）
+			s.checkBatchCounted(b, t, over)
+		}
+	}
+}
+
+// verifyYescryptChunks 把候选按波下发 yescrypt GPU 校验，返回错误表示 GPU 不可用。
+//
+// 每波校验**真正完成后**才计入 attempts 与字典进度：一批 131072 个候选
+// 在默认参数下要跑几十分钟，若在提交时一次性计数，速率会先虚高再持续下滑，
+// 进度条也会长时间不动。
+func (s *session) verifyYescryptChunks(ctx context.Context, b *wordBatch, t *target,
+	cands []string, chunk, device int) error {
+	if chunk < 1 {
+		chunk = hashacYescryptChunkFallback
+	}
+	for off := 0; off < len(cands); {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if t.cracked.Load() {
+			return nil
+		}
+		end := off + chunk
+		if end > len(cands) {
+			end = len(cands)
+		}
+		part := cands[off:end]
+
+		idx, err := cuda.VerifyYescrypt(*t.t.YGPU, part, device)
+		if err != nil {
+			// 这一波及后续候选一枚都没在 GPU 上校验过，交给 CPU 兜底
+			s.checkBatchCounted(b, t, cands[off:])
+			return err
+		}
+		t.attempts.Add(int64(len(part)))
+		b.consumeN(&s.checked, len(part))
+		off = end
+
+		if idx >= 0 {
+			// GPU 只做派生密钥比对，仍然 CPU 复核一次，避免与库实现差异误报
+			pw := part[idx]
+			if t.t.Check.Check(pw) {
+				s.hit(t, pw)
+				return nil
+			}
+			// 误报：内核给的是本波最小的匹配下标，真正的命中可能在其后。
+			// 本波已在上面计入 attempts，这里只补查剩余候选、不重复计数。
+			for _, rest := range part[idx+1:] {
+				if t.cracked.Load() {
+					return nil
+				}
+				if t.t.Check.Check(rest) {
+					s.hit(t, rest)
+					return nil
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// checkBatchCounted 在 CPU 上逐个校验候选，并同步推进 attempts 与字典进度。
+//
+// 只在真正校验完一个候选后计数，慢速算法（yescrypt）的速率曲线才不会失真。
+func (s *session) checkBatchCounted(b *wordBatch, t *target, cands []string) {
+	if len(cands) == 0 {
+		return
+	}
+	n := 0
+	for _, pw := range cands {
+		if t.cracked.Load() {
+			break
+		}
+		n++
+		t.attempts.Add(1)
+		if t.t.Check.Check(pw) {
+			s.hit(t, pw)
+			break
+		}
+	}
+	b.consumeN(&s.checked, n)
 }
 
 // confirmGPU 向 GPU 索取命中候选并用 CPU 复核，确认后登记结果。

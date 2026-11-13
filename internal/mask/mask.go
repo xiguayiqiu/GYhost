@@ -277,6 +277,54 @@ func (s *FileSource) Close() error {
 	return s.f.Close()
 }
 
+// CountLines 统计字典文件的行数（候选总数）。
+//
+// 口径与 FileSource.Each 逐行读取一致：以 '\n' 分隔；末尾没有换行符的最后
+// 一段也算一行；空行也算一行（枚举时会产出一个空候选）。
+//
+// 用途是估算字典枚举进度。大字典读一遍要花时间，调用方通常放到后台做，
+// 在拿到结果前先按「总数未知」显示进度。
+//
+// 注：FileSource.Each 的 bufio.Scanner 单行上限为 1 MiB，超长行会让枚举
+// 提前停止；本函数不设此上限，因此两者的行数可能对不上（只影响进度百分比）。
+func CountLines(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, 1<<20)
+	var (
+		lines int64
+		read  int64
+		last  byte
+	)
+	for {
+		n, err := f.Read(buf)
+		for i := 0; i < n; i++ {
+			if buf[i] == '\n' {
+				lines++
+			}
+		}
+		if n > 0 {
+			read += int64(n)
+			last = buf[n-1]
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	// 末尾没有换行符时，最后一段也算一行
+	if read > 0 && last != '\n' {
+		lines++
+	}
+	return lines, nil
+}
+
 // Enumerator 按掩码实时枚举候选。
 type Enumerator struct{ m *Mask }
 

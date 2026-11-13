@@ -53,6 +53,7 @@ func (m *Module) Run(args []string) error {
 		output   string
 		quiet    bool
 		gpu      bool
+		gpuYescr bool
 		users    userList
 	)
 	fs.StringVar(&input, "i", "", i18n.T("shadow.flag.input"))
@@ -70,6 +71,7 @@ func (m *Module) Run(args []string) error {
 	fs.BoolVar(&quiet, "q", false, i18n.T("shadow.flag.quiet"))
 	fs.BoolVar(&quiet, "quiet", false, i18n.T("shadow.flag.quiet"))
 	fs.BoolVar(&gpu, "gpu", false, i18n.T("shadow.flag.gpu"))
+	fs.BoolVar(&gpuYescr, "gpu-yescrypt", false, i18n.T("shadow.flag.gpu_yes"))
 	fs.Usage = func() { fmt.Println(m.Usage()) }
 
 	if err := fs.Parse(args); err != nil {
@@ -104,6 +106,7 @@ func (m *Module) Run(args []string) error {
 		OutputPath:   output,
 		Users:        users,
 		GPU:          gpu,
+		GPUYescrypt:  gpuYescr,
 		Progress:     progress,
 		OnCrack:      hitPrinter(os.Stdout),
 		OnNotice:     noticePrinter(os.Stderr),

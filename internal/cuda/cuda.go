@@ -33,6 +33,21 @@ const (
 	AlgoSHA256Crypt = 5
 	// AlgoSHA512Crypt sha512crypt，shadow 中的 $6$。
 	AlgoSHA512Crypt = 6
+	// 注意：$y$ yescrypt 不在此处编号。它走独立入口
+	// （VerifyYescrypt / gyhost_cuda_verify_yescrypt），
+	// 参数是 N/r 而不是 salt/rounds，因此没有 algo-id 分发。
+)
+
+// yescrypt 的参数与长度上限（与 go-crypt/x/yescrypt 的 Hash() 一致）。
+const (
+	// MinYescryptNLog2 / MaxYescryptNLog2 是 N = 1<<NLog2 的合法范围。
+	MinYescryptNLog2 = 10
+	MaxYescryptNLog2 = 18
+	// MinYescryptR / MaxYescryptR 是块大小因子的合法范围。
+	MinYescryptR = 1
+	MaxYescryptR = 32
+	// YescryptKeyLen 是 yescrypt 派生密钥的字节数。
+	YescryptKeyLen = 32
 )
 
 // 通用哈希算法编号（hashac 使用），与 cuda.h 中的 GYHOST_HASH_* 对应。
@@ -214,6 +229,130 @@ func AlgoID(algo string) (int, bool) {
 func Supported(algo string) bool {
 	_, ok := AlgoID(algo)
 	return ok
+}
+
+// ---------------------------------------------------------------------------
+// yescrypt 目标（shadow 模块的 $y$）
+// ---------------------------------------------------------------------------
+
+// YescryptTarget 是一个可在 GPU 上校验的 yescrypt($y$) 目标哈希。
+//
+// 与 Target 不同，yescrypt 的盐与目标密钥都按**解码后的原始字节**下发：
+// 编码串里的盐与密文都是 crypt base64，先在 Go 侧解好再送进内核，
+// 免得设备端再实现一遍 base64 解码（两套实现一旦有偏差就会给出错误结论）。
+type YescryptTarget struct {
+	NLog2 int    // N = 1<<NLog2
+	R     int    // 块大小因子
+	Salt  []byte // 解码后的盐字节
+	Key   []byte // 目标派生密钥（YescryptKeyLen 字节）
+}
+
+// Validate 校验该目标能否交给 GPU 处理。
+func (t YescryptTarget) Validate() error {
+	if t.NLog2 < MinYescryptNLog2 || t.NLog2 > MaxYescryptNLog2 {
+		return ErrParam
+	}
+	if t.R < MinYescryptR || t.R > MaxYescryptR {
+		return ErrParam
+	}
+	if len(t.Salt) > MaxSaltLen {
+		return ErrParam
+	}
+	if len(t.Key) != YescryptKeyLen {
+		return ErrParam
+	}
+	return nil
+}
+
+// MemPerCandidate 返回单个候选在显存中占用的字节数。
+//
+// yescrypt 的 v 数组是 16*N*r 个 uint64（N=4096、r=32 时约 16 MiB），
+// 这是算法本身的内存硬性要求：GPU 上能同时校验多少个候选，
+// 由显存决定而不是由显卡算力决定。
+func (t YescryptTarget) MemPerCandidate() int64 {
+	n := int64(1) << uint(t.NLog2)
+	return 16 * n * int64(t.R) * 8
+}
+
+// VerifyYescrypt 在指定设备上批量校验 yescrypt 候选密码，
+// 返回首个命中的候选下标（无命中为 -1）。
+//
+// 一批候选共享同一个目标；候选必须满足 len(pw) <= MaxPasswordLen，
+// 超长候选请由调用方回退 CPU 校验。
+//
+// 显存不足以放下一个候选时返回 ErrRuntime（底层是显存分配失败），
+// 调用方据此回退 CPU。
+func VerifyYescrypt(t YescryptTarget, passwords []string, device int) (int, error) {
+	if !compiled() {
+		return -1, ErrNotCompiled
+	}
+	if err := t.Validate(); err != nil {
+		return -1, err
+	}
+	if len(passwords) == 0 {
+		return -1, nil
+	}
+	if len(passwords) > MaxBatch {
+		return -1, ErrParam
+	}
+	if device < 0 {
+		return -1, ErrParam
+	}
+	data, offs, lens, err := flatten(passwords)
+	if err != nil {
+		return -1, err
+	}
+	return verifyYescryptNative(t.NLog2, t.R, data, offs, lens, t.Salt, t.Key, device)
+}
+
+// YescryptWaveSize 返回一次能并发校验多少个 yescrypt 候选（受空闲显存限制）。
+//
+// 调用方分块下发时，块大小不应小于这个值：yescrypt 内核是「一线程一候选」，
+// 耗时由最慢的一个 warp 决定，块变小并不会更快，只会把 GPU 的并发度白白扔掉
+// （实测块从 178 降到 40，吞吐掉了 4 倍）。
+//
+// 没有可用设备或连一个候选都放不下时返回错误。
+func YescryptWaveSize(nlog2, r, device int) (int, error) {
+	if !compiled() {
+		return 0, ErrNotCompiled
+	}
+	if nlog2 < MinYescryptNLog2 || nlog2 > MaxYescryptNLog2 {
+		return 0, ErrParam
+	}
+	if r < MinYescryptR || r > MaxYescryptR {
+		return 0, ErrParam
+	}
+	if device < 0 {
+		return 0, ErrParam
+	}
+	return yescryptWaveSizeNative(nlog2, r, device)
+}
+
+// ChunkSize 返回一次内核发射处理的候选数（crypt 路径的内部粒度）。
+//
+// 分块下发时块不应小于它：内核耗时由最慢的一个 warp 决定，
+// 块太小等于主动丢掉 GPU 并发度。
+func ChunkSize() int { return chunkSizeNative() }
+
+// CheckYescrypt 使用主机端（CPU）参考实现校验单个密码。
+//
+// 它与 GPU 内核共用 cuda.cu 中的同一套算法代码，用于一致性自检与调试，
+// 不会访问 GPU。
+func CheckYescrypt(t YescryptTarget, password string) (bool, error) {
+	if !compiled() {
+		return false, ErrNotCompiled
+	}
+	if err := t.Validate(); err != nil {
+		return false, err
+	}
+	if len(password) > MaxPasswordLen {
+		return false, ErrPasswordTooLong
+	}
+	rc, err := checkYescryptNative(t.NLog2, t.R, password, t.Salt, t.Key)
+	if err != nil {
+		return false, err
+	}
+	return rc == 1, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +948,12 @@ const WarmUpDuration = 400 * time.Millisecond
 // warmUpCandidates 每次预热批次的候选数（够大才能吃满 GPU）。
 const warmUpCandidates = 1 << 16
 
+// warmUpYescryptCandidates yescrypt 预热批次的候选数。
+//
+// 每个候选独占 16 MiB 显存（N=4096、r=32），批量必须小，
+// 否则预热本身就会因为显存不足而失败。
+const warmUpYescryptCandidates = 4
+
 // warmUpBatch 生成预热用候选（内容无意义，只要长度合法、数量足够）。
 func warmUpBatch(n int) []string {
 	out := make([]string, n)
@@ -837,6 +982,31 @@ func WarmUp(t Target, device int, d time.Duration) error {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if _, err := Verify(t, batch, device); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WarmUpYescrypt 与 WarmUp 相同，用于 yescrypt($y$) 目标。
+//
+// yescrypt 每个候选要独占一块 16*N*r 个 uint64 的 v 数组（N=4096、r=32
+// 时约 16 MiB），而且单次计算很重，所以预热批次必须很小，
+// 否则光候选区就会把整块显存吃光。
+func WarmUpYescrypt(t YescryptTarget, device int, d time.Duration) error {
+	if !compiled() {
+		return ErrNotCompiled
+	}
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	batch := warmUpBatch(warmUpYescryptCandidates)
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if _, err := VerifyYescrypt(t, batch, device); err != nil {
 			return err
 		}
 	}

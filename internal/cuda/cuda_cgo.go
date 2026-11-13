@@ -152,8 +152,81 @@ func verifyEndNative(handle, device int) (int, error) {
 	return int(match), nil
 }
 
+// verifyYescryptNative 调用 gyhost_cuda_verify_yescrypt，返回 (命中下标, 错误)。
+func verifyYescryptNative(nlog2, r int, data []byte, offs, lens []int32, salt, key []byte, device int) (int, error) {
+	if len(data) == 0 || len(offs) == 0 || len(offs) != len(lens) {
+		return -1, ErrParam
+	}
+
+	cOffs := make([]C.int, len(offs))
+	for i, v := range offs {
+		cOffs[i] = C.int(v)
+	}
+	cLens := make([]C.int, len(lens))
+	for i, v := range lens {
+		cLens[i] = C.int(v)
+	}
+
+	cSalt, freeSalt := cBytes(salt)
+	defer freeSalt()
+	cKey, freeKey := cBytes(key)
+	defer freeKey()
+
+	var match C.int
+	rc := int(C.gyhost_cuda_verify_yescrypt(
+		C.int(nlog2),
+		C.int(r),
+		(*C.char)(unsafe.Pointer(&data[0])), C.int(len(data)),
+		(*C.int)(unsafe.Pointer(&cOffs[0])),
+		(*C.int)(unsafe.Pointer(&cLens[0])),
+		C.int(len(cOffs)),
+		(*C.uint8_t)(cSalt), C.int(len(salt)),
+		(*C.uint8_t)(cKey),
+		C.int(device),
+		&match,
+	))
+	if rc != codeOK {
+		return -1, errFromCode(rc)
+	}
+	return int(match), nil
+}
+
+// checkYescryptNative 调用 gyhost_cuda_check_yescrypt，返回 (1 命中 / 0 未命中, 错误)。
+func checkYescryptNative(nlog2, r int, password string, salt, key []byte) (int, error) {
+	cPw, freePw := cBytes([]byte(password))
+	defer freePw()
+	cSalt, freeSalt := cBytes(salt)
+	defer freeSalt()
+	cKey, freeKey := cBytes(key)
+	defer freeKey()
+
+	rc := int(C.gyhost_cuda_check_yescrypt(
+		C.int(nlog2),
+		C.int(r),
+		(*C.char)(cPw), C.int(len(password)),
+		(*C.uint8_t)(cSalt), C.int(len(salt)),
+		(*C.uint8_t)(cKey),
+	))
+	if rc < 0 {
+		return 0, errFromCode(rc)
+	}
+	return rc, nil
+}
+
 // pipelineSlotsNative 返回 native 侧异步流水线可同时在飞的批次数。
 func pipelineSlotsNative() int { return int(C.gyhost_cuda_pipeline_slots()) }
+
+// yescryptWaveSizeNative 调用 gyhost_cuda_yescrypt_wave，返回一次能并发校验的候选数。
+func yescryptWaveSizeNative(nlog2, r, device int) (int, error) {
+	n := int(C.gyhost_cuda_yescrypt_wave(C.int(nlog2), C.int(r), C.int(device)))
+	if n < 0 {
+		return 0, errFromCode(n)
+	}
+	return n, nil
+}
+
+// chunkSizeNative 调用 gyhost_cuda_chunk，返回一次内核发射处理的候选数。
+func chunkSizeNative() int { return int(C.gyhost_cuda_chunk()) }
 
 // verifyHashNative 调用 gyhost_cuda_verify_hash，返回 (命中下标, 错误)。
 func verifyHashNative(algo int, data []byte, offs, lens []int32, salt, extra, check, iv []byte, iter, keyLen, device int) (int, error) {

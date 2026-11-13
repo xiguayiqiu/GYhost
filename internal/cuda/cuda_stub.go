@@ -40,7 +40,21 @@ func verifyEndNative(handle, device int) (int, error) {
 	return -1, ErrNotCompiled
 }
 
+func verifyYescryptNative(nlog2, r int, data []byte, offs, lens []int32, salt, key []byte, device int) (int, error) {
+	return -1, ErrNotCompiled
+}
+
+func checkYescryptNative(nlog2, r int, password string, salt, key []byte) (int, error) {
+	return 0, ErrNotCompiled
+}
+
 func pipelineSlotsNative() int { return 0 }
+
+// yescryptWaveSizeNative 无 CUDA 构建：拿不到并发度。
+func yescryptWaveSizeNative(nlog2, r, device int) (int, error) { return 0, ErrNotCompiled }
+
+// chunkSizeNative 无 CUDA 构建：给一个保守的默认值。
+func chunkSizeNative() int { return 8192 }
 
 func checkHashNative(algo int, password string, salt, extra, check, iv []byte, iter, keyLen int) (int, error) {
 	return 0, ErrNotCompiled

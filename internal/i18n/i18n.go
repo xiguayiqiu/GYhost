@@ -134,9 +134,10 @@ var messages = map[Lang]map[string]string{
 		"mod.err.dup":       "module: 模块 %q 重复注册",
 
 		// ==================== pwdhash ====================
-		"pwdhash.err.empty":       "pwdhash: 哈希为空",
-		"pwdhash.err.unsupported": "pwdhash: 不支持的哈希格式 %q",
-		"pwdhash.err.register":    "pwdhash: 注册解码器失败",
+		"pwdhash.err.empty":              "pwdhash: 哈希为空",
+		"pwdhash.err.unsupported":        "pwdhash: 不支持的哈希格式 %q",
+		"pwdhash.err.register":           "pwdhash: 注册解码器失败",
+		"pwdhash.err.unsupported_detail": "算法或参数不受支持",
 
 		// ==================== shadow 模块 ====================
 		"shadow.group":        "本地分析",
@@ -149,6 +150,7 @@ var messages = map[Lang]map[string]string{
 		"shadow.flag.out":     "结果输出文件",
 		"shadow.flag.quiet":   "静默模式，不显示实时进度",
 		"shadow.flag.gpu":     "用 GPU (CUDA) 加速破解，不可用时自动回退 CPU（需要 root/管理员权限）",
+		"shadow.flag.gpu_yes": "把 $y$ yescrypt 目标也交给 GPU（默认留给 CPU：yescrypt 内存硬，小显存卡上 GPU 往往更慢）",
 		"shadow.usage": `gyhost shadow - 离线爆破 shadow 文件中的密码哈希
 
 用法:
@@ -166,6 +168,9 @@ var messages = map[Lang]map[string]string{
   -o, -out      可选，将破解结果以 user:password 写入该文件
   -q, -quiet    静默模式，不显示实时进度
   --gpu         用 GPU (CUDA) 加速，不可用时回退 CPU（需要 root/管理员权限）
+  --gpu-yescrypt
+                把 $y$ yescrypt 目标也交给 GPU（默认留给 CPU：yescrypt 内存硬，
+                小显存卡上 GPU 远不如多核 CPU，详见 README）
 
 输出:
   结果/统计 -> stdout（彩色），实时进度 -> stderr（TTY 上单行刷新）
@@ -209,7 +214,7 @@ var messages = map[Lang]map[string]string{
 		"shadow.gpu.needs_root":    "[!] 启用 GPU 需要 root 权限（Windows 上为管理员），已回退 CPU 爆破；请用 sudo 或以管理员身份重新运行",
 		"shadow.gpu.not_compiled":  "[!] 当前程序未启用 CUDA 编译，已回退 CPU 爆破（用 make 重新构建即可启用 GPU）",
 		"shadow.gpu.no_device":     "[!] 未检测到可用的 CUDA 设备，已回退 CPU 爆破",
-		"shadow.gpu.unsupported":   "[!] 目标哈希不支持 GPU（仅 $1$/$5$/$6$），已回退 CPU 爆破",
+		"shadow.gpu.unsupported":   "[!] 目标哈希不支持 GPU（仅 $1$/$5$/$6$/$y$），已回退 CPU 爆破",
 		"shadow.gpu.warmup":        "[*] 正在唤醒 GPU 并提升核心频率（约 %s）…",
 		"shadow.gpu.runtime_error": "[!] GPU 校验出错，已回退 CPU 爆破: %s",
 		"shadow.report.gpu":        "[*] GPU 设备: %s（%s MB 显存）",
@@ -232,7 +237,13 @@ var messages = map[Lang]map[string]string{
 		"shadow.progress.more":      " 等%s个",
 		"shadow.progress.finished":  " 全部命中，收尾中…",
 		"shadow.progress.tail":      "%s | %s",
+		"shadow.progress.tail_eta":  "%s | %s | %s",
 		"shadow.progress.rate":      "%s次/秒",
+		"shadow.progress.eta":       "剩余 %s",
+		"shadow.progress.dur.sec":   "%d秒",
+		"shadow.progress.dur.min":   "%d分",
+		"shadow.progress.dur.hour":  "%d时%d分",
+		"shadow.progress.dur.day":   "%d天%d时",
 
 		// ---- shadow 破解命中 ----
 		"shadow.hit.format": "%s %s  %s",
@@ -375,7 +386,7 @@ var messages = map[Lang]map[string]string{
 
 说明:
   32 位十六进制在 MD5 与 NTLM 之间有歧义，两个模式号都会给出；
-  yescrypt（$y$）在 hashcat 中没有原生模式，只给出算法名
+  yescrypt（$y$）对应 -m 36100（hashcat v8.0.0 起支持）
 
 示例:
   gyhost hashcat -i secret.zip              # 这个压缩包用了什么算法
@@ -482,6 +493,7 @@ var messages = map[Lang]map[string]string{
                                  V<=4 的 RC4/AES 与 V=5 的 AES-256，用户/所有者口令都试
   office-2007 / 2010 / 2013      $office$...（-m 9400/9500/9600）
                                  加密的 docx/xlsx/pptx（含 WPS 兼容保存）口令校验
+  yescrypt                       $y$...（-m 36100）
   其中 $... 格式可由 gyhost hashdump 直接从加密压缩包、加密 PDF 或加密 Office 文档提取
 
 输出:
@@ -524,6 +536,7 @@ var messages = map[Lang]map[string]string{
 		"hashac.algo.office-2007":    "Office 2007",
 		"hashac.algo.office-2010":    "Office 2010",
 		"hashac.algo.office-2013":    "Office 2013",
+		"hashac.algo.yescrypt":       "yescrypt（$y$）",
 
 		// ---- hashac 错误 ----
 		"hashac.err.missing_args":  "缺少必填参数: -i [哈希文件]，以及 -p [密码字典] 或 -m [掩码] 之一",
@@ -1429,9 +1442,10 @@ var messages = map[Lang]map[string]string{
 		"mod.err.dup":       "module: module %q already registered",
 
 		// ==================== pwdhash ====================
-		"pwdhash.err.empty":       "pwdhash: empty hash",
-		"pwdhash.err.unsupported": "pwdhash: unsupported hash format %q",
-		"pwdhash.err.register":    "pwdhash: failed to register decoders",
+		"pwdhash.err.empty":              "pwdhash: empty hash",
+		"pwdhash.err.unsupported":        "pwdhash: unsupported hash format %q",
+		"pwdhash.err.register":           "pwdhash: failed to register decoders",
+		"pwdhash.err.unsupported_detail": "algorithm or parameters are not supported",
 
 		// ==================== shadow module ====================
 		"shadow.group":        "Local Analysis",
@@ -1444,6 +1458,7 @@ var messages = map[Lang]map[string]string{
 		"shadow.flag.out":     "result output file",
 		"shadow.flag.quiet":   "quiet mode, hide live progress",
 		"shadow.flag.gpu":     "accelerate with a GPU (CUDA), falling back to CPU when unavailable (requires root/administrator)",
+		"shadow.flag.gpu_yes": "also hand $y$ yescrypt targets to the GPU (they stay on the CPU by default: yescrypt is memory-hard and the GPU is often slower on small-VRAM cards)",
 		"shadow.usage": `gyhost shadow - Offline password cracking for shadow files
 
 Usage:
@@ -1461,6 +1476,10 @@ Options:
   -o, -out      optional, write results as user:password
   -q, -quiet    quiet mode, hide the live progress line
   --gpu         accelerate with a GPU (CUDA), falls back to CPU (requires root/administrator)
+  --gpu-yescrypt
+                also hand $y$ yescrypt targets to the GPU (they stay on the CPU by
+                default: yescrypt is memory-hard and the GPU is much slower on
+                small-VRAM cards, see the README)
 
 Output:
   results/summary -> stdout (colored), live progress -> stderr (single refreshed line on TTY)
@@ -1504,7 +1523,7 @@ Examples:
 		"shadow.gpu.needs_root":    "[!] enabling the GPU requires root (administrator on Windows), falling back to CPU; re-run with sudo or as Administrator",
 		"shadow.gpu.not_compiled":  "[!] built without CUDA support, falling back to CPU (rebuild with make to enable GPU)",
 		"shadow.gpu.no_device":     "[!] no usable CUDA device found, falling back to CPU",
-		"shadow.gpu.unsupported":   "[!] target hashes are not GPU-capable ($1$/$5$/$6$ only), falling back to CPU",
+		"shadow.gpu.unsupported":   "[!] target hashes are not GPU-capable ($1$/$5$/$6$/$y$ only), falling back to CPU",
 		"shadow.gpu.warmup":        "[*] Waking up the GPU and boosting its clocks (about %s)...",
 		"shadow.gpu.runtime_error": "[!] GPU verification failed, falling back to CPU: %s",
 
@@ -1527,7 +1546,13 @@ Examples:
 		"shadow.progress.more":      " +%s more",
 		"shadow.progress.finished":  " all cracked, finishing…",
 		"shadow.progress.tail":      "%s | %s",
+		"shadow.progress.tail_eta":  "%s | %s | %s",
 		"shadow.progress.rate":      "%s/s",
+		"shadow.progress.eta":       "%s left",
+		"shadow.progress.dur.sec":   "%ds",
+		"shadow.progress.dur.min":   "%dm",
+		"shadow.progress.dur.hour":  "%dh%dm",
+		"shadow.progress.dur.day":   "%dd%dh",
 
 		// ---- shadow hit ----
 		"shadow.hit.format": "%s %s  %s",
@@ -1674,7 +1699,7 @@ What is recognized:
 
 Notes:
   32 hex chars is ambiguous between MD5 and NTLM, so both modes are printed;
-  yescrypt ($y$) has no native hashcat mode, only the algorithm name is shown
+  yescrypt ($y$) maps to -m 36100 (supported since hashcat v8.0.0)
 
 Examples:
   gyhost hashcat -i secret.zip              # which algorithm does this archive use
@@ -1781,6 +1806,7 @@ Supported types (auto detected; hashcat mode in parentheses):
                                  RC4/AES for V<=4 and AES-256 for V=5; tries user and owner passwords
   office-2007 / 2010 / 2013      $office$... (-m 9400/9500/9600)
                                  password verifier for encrypted docx/xlsx/pptx (incl. WPS-compatible saves)
+  yescrypt                       $y$... (-m 36100)
   the $... forms can be produced by "gyhost hashdump" from encrypted archives, PDFs or Office documents
 
 Output:
@@ -1823,6 +1849,7 @@ Examples:
 		"hashac.algo.office-2007":    "Office 2007",
 		"hashac.algo.office-2010":    "Office 2010",
 		"hashac.algo.office-2013":    "Office 2013",
+		"hashac.algo.yescrypt":       "yescrypt ($y$)",
 
 		// ---- hashac errors ----
 		"hashac.err.missing_args":  "missing required options: -i [hash file], plus either -p [wordlist] or -m [mask]",

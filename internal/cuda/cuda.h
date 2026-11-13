@@ -30,7 +30,11 @@ extern "C" {
 #define GYHOST_CUDA_ERR_KERNEL (-4) /* 内核启动或同步失败 */
 #define GYHOST_CUDA_ERR_ALGO (-5)   /* 不支持的哈希算法 */
 
-/* ---- 算法编号：与 internal/pwdhash 的 AlgoOf 保持一致 ---- */
+/* ---- 算法编号：与 internal/pwdhash 的 AlgoOf 保持一致 ----
+ *
+ * 注意：$y$ yescrypt 没有编号，它的参数是 N/r 而不是 salt/rounds，
+ * 走独立入口 gyhost_cuda_check_yescrypt / gyhost_cuda_verify_yescrypt。
+ */
 #define GYHOST_ALGO_MD5CRYPT 1    /* $1$   */
 #define GYHOST_ALGO_SHA256CRYPT 5  /* $5$   */
 #define GYHOST_ALGO_SHA512CRYPT 6  /* $6$   */
@@ -212,6 +216,54 @@ int gyhost_cuda_verify_begin(int algo,
 
 /* 等 gyhost_cuda_verify_begin 提交的那批完成，读回首个命中下标（无命中为 -1）。 */
 int gyhost_cuda_verify_end(int handle, int device, int *match);
+
+/*
+ * gyhost_cuda_check_yescrypt — yescrypt($y$) 的主机端（CPU）参考实现。
+ *
+ * 与 GPU 内核共用同一套算法代码，返回 1 命中 / 0 未命中 / 负数错误码。
+ *
+ * nlog2   N = 1<<nlog2（10..18）
+ * r       块大小因子（1..32）
+ * salt    解码后的盐字节（<= 64 字节）
+ * key32   目标派生密钥（32 字节）
+ */
+int gyhost_cuda_check_yescrypt(int nlog2, int r, const char *pw, int pw_len,
+                               const uint8_t *salt, int salt_len,
+                               const uint8_t *key32);
+
+/*
+ * gyhost_cuda_verify_yescrypt — yescrypt($y$) 的批量校验（GPU）。
+ *
+ * 参数含义与 gyhost_cuda_verify 相同，另加 yescrypt 专有的 nlog2/r，
+ * 且盐与目标密钥都是**解码后的原始字节**（盐 <= 64 字节，密钥固定 32 字节）。
+ *
+ * 注意：每个候选要独占一块 16*N*r 个 uint64 的 v 数组（N=4096、r=32 时约
+ * 16 MiB），因此并发候选数由显存决定。显存不足时返回 GYHOST_CUDA_ERR_ALLOC，
+ * 调用方应回退 CPU 校验。
+ */
+int gyhost_cuda_verify_yescrypt(int nlog2, int r,
+                                const char *pw_data, int pw_total,
+                                const int *pw_off, const int *pw_len, int count,
+                                const uint8_t *salt, int salt_len,
+                                const uint8_t *key32, int device, int *match);
+
+/*
+ * gyhost_cuda_yescrypt_wave — 一次能并发校验多少个 yescrypt 候选。
+ *
+ * 每个候选要独占一块 16·N·r 字节的工作区，所以并发数由空闲显存决定。
+ * 调用方分块下发时，块大小不应小于这个值：yescrypt 内核是「一线程一候选」，
+ * 耗时由最慢的一个 warp 决定，块变小并不会更快，只会把并发度白白扔掉。
+ *
+ * 返回负数表示出错（没有设备 / 连一个候选都放不下）。
+ */
+int gyhost_cuda_yescrypt_wave(int nlog2, int r, int device);
+
+/*
+ * gyhost_cuda_chunk — 一次内核发射处理的候选数（crypt 路径的内部粒度）。
+ *
+ * 与 GY_CHUNK 保持一致：分块下发时块不应小于它，否则同样会丢掉并发度。
+ */
+int gyhost_cuda_chunk(void);
 
 /*
  * gyhost_cuda_pipeline_slots — 异步流水线可同时在飞的批次数上限。

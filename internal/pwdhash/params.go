@@ -3,6 +3,8 @@ package pwdhash
 import (
 	"strconv"
 	"strings"
+
+	"github.com/go-crypt/x/yescrypt"
 )
 
 // sha-crypt 省略 rounds 参数时的缺省轮数，与 go-crypt 的
@@ -11,6 +13,20 @@ const defaultSHACryptRounds = 5000
 
 // md5crypt 的固定轮数（算法规定，与 go-crypt 的 KeyMD5Crypt 一致）。
 const md5cryptRounds = 1000
+
+// yescrypt 的参数与长度上限，与 go-crypt/x/yescrypt 的 Hash() 保持一致。
+const (
+	// yescryptMinNLog2 / yescryptMaxNLog2 是 N = 1<<NLog2 的合法范围。
+	yescryptMinNLog2 = 10
+	yescryptMaxNLog2 = 18
+	// yescryptMinR / yescryptMaxR 是块大小因子的合法范围。
+	yescryptMinR = 1
+	yescryptMaxR = 32
+	// yescryptKeyLen 是派生密钥的字节数。
+	yescryptKeyLen = 32
+	// yescryptMaxSalt 是解码后盐的最大字节数。
+	yescryptMaxSalt = 64
+)
 
 // CryptParams 是 $1$ / $5$ / $6$ 编码哈希解析出的可重算参数，
 // 供 GPU（internal/cuda）以及其它需要“重算并比对”的场景复用。
@@ -73,4 +89,64 @@ func ParseCrypt(encodedHash string) (p CryptParams, ok bool) {
 	}
 
 	return CryptParams{Algo: algo, Salt: salt, Rounds: rounds, Key: key}, true
+}
+
+// YescryptParams 是 $y$ 编码哈希解析出的可重算参数，
+// 供 GPU（internal/cuda）以及其它需要“重算并比对”的场景复用。
+type YescryptParams struct {
+	NLog2 int    // N = 1<<NLog2
+	R     int    // 块大小因子
+	Salt  []byte // 解码后的盐字节
+	Key   []byte // 目标派生密钥（32 字节）
+}
+
+// ParseYescrypt 解析 $y$ 编码哈希（yescrypt）。
+// 格式不支持或参数非法时返回 ok=false。
+//
+// 格式：
+//
+//	$y$j<ln><r>$<盐>$<密文>
+//
+// 其中 <ln>、<r> 是 crypt base64 字符，分别编码 ln-1 与 r-1；
+// 盐与密文同样是 crypt base64，解码后分别是原始盐字节与 32 字节密钥。
+//
+// 解析口径必须与 go-crypt/x/yescrypt 的 Hash() 完全一致，
+// 否则 GPU 与 CPU 会对同一个哈希给出不同结论：
+//   - 参数段固定为 "j" + 两个字符，用库内 DecodeSetting 解码（同一套字符表）
+//   - ln 必须落在 [2^10, 2^18]，r 必须落在 [1, 32]
+//   - 密文解码后必须正好 32 字节
+//
+// 实际使用时应先用 NewChecker 确认哈希可解码，再调用本函数。
+func ParseYescrypt(encodedHash string) (p YescryptParams, ok bool) {
+	h := strings.TrimSpace(encodedHash)
+	if !strings.HasPrefix(h, "$y$j") || len(h) < 7 || h[6] != '$' {
+		return YescryptParams{}, false
+	}
+
+	// 参数段："j" + <ln> + <r>
+	_, nlog2, r, err := yescrypt.DecodeSetting([]byte(h[3:6]))
+	if err != nil {
+		return YescryptParams{}, false
+	}
+	if nlog2 < yescryptMinNLog2 || nlog2 > yescryptMaxNLog2 ||
+		r < yescryptMinR || r > yescryptMaxR {
+		return YescryptParams{}, false
+	}
+
+	// 盐与密文以最后一个 '$' 分隔
+	saltEnd := strings.LastIndexByte(h, '$')
+	if saltEnd < 7 || saltEnd+1 >= len(h) {
+		return YescryptParams{}, false
+	}
+
+	salt := yescrypt.Decode64([]byte(h[7:saltEnd]))
+	if salt == nil || len(salt) > yescryptMaxSalt {
+		return YescryptParams{}, false
+	}
+	key := yescrypt.Decode64([]byte(h[saltEnd+1:]))
+	if key == nil || len(key) != yescryptKeyLen {
+		return YescryptParams{}, false
+	}
+
+	return YescryptParams{NLog2: nlog2, R: r, Salt: salt, Key: key}, true
 }

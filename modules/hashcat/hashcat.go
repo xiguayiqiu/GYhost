@@ -270,7 +270,7 @@ func isPlainField(s string) bool {
 // identifyHash 按前缀/长度识别一条哈希的类型。
 //
 // 返回算法 key 与候选 hashcat 模式号。32 位十六进制在 MD5 与 NTLM 之间
-// 天然有歧义，两者都返回；yescrypt 在 hashcat 7.x 无原生模式，只返回算法名。
+// 天然有歧义，两者都返回。
 func identifyHash(h string) (string, []int, bool) {
 	switch {
 	case strings.HasPrefix(h, "WPA*01*"):
@@ -363,8 +363,8 @@ func identifyHash(h string) (string, []int, bool) {
 	case strings.HasPrefix(h, "$pbkdf2-sha256$"):
 		return "django-pbkdf2", []int{10000}, true
 	case strings.HasPrefix(h, "$y$"):
-		// hashcat 7.x 没有 yescrypt 原生模式（需 Python 插件），只给算法名
-		return "yescrypt", nil, true
+		// yescrypt 自 hashcat v8.0.0 起有原生模式（此前的版本没有）
+		return "yescrypt", []int{36100}, true
 	}
 
 	if !isHex(h) {
@@ -458,7 +458,7 @@ func printReport(w io.Writer, rep *report, quiet bool) {
 }
 
 // modeText 把模式号列表渲染成 "-m 0 / -m 1000"；
-// 没有原生模式时（如 yescrypt）返回占位说明。
+// 没有原生模式时返回占位说明。
 func modeText(modes []int) string {
 	if len(modes) == 0 {
 		return utils.Warn("%s", i18n.T("hashcat.mode.none"))
@@ -510,7 +510,7 @@ var catalog = []struct {
 		{"scrypt", "-m 8900"},
 		{"argon2", "-m 34000"},
 		{"django-pbkdf2", "-m 10000"},
-		{"yescrypt", ""},
+		{"yescrypt", "-m 36100"},
 	}},
 	{kindOffice, []struct{ algo, modes string }{
 		{"office-2007", "-m 9400"},

@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <pthread.h>
 
@@ -56,6 +57,66 @@ GY_HOSTDEV inline void gy_copy(void *dst, const void *src, int n) {
     const unsigned char *s = (const unsigned char *)src;
     for (int i = 0; i < n; i++) {
         d[i] = s[i];
+    }
+}
+
+/*
+ * gy_copy16 — 按 128 位（16 字节）拷贝，单位是 16 字节的块数。
+ *
+ * 为什么需要它：yescrypt 的 ROMix 每轮都要把一个 4 KiB 的块写进 v 数组，
+ * N=4096 轮下来每个候选要写 16 MiB。逐字节拷贝（gy_copy）在 GPU 上是灾难：
+ * 一个 warp 里 32 个线程各写各的区域，地址互不相同，既无法合并，
+ * 又因为只写 1 字节而把 32 字节的 sector 拉进来——写放大 32 倍。
+ * 实测这部分访存指令数与 pwxform 的随机查表相当，是内核最大的开销来源。
+ *
+ * 工作区的排布保证 16 字节对齐（v 数组按 128·r 字节步进，xy 紧随其后，
+ * 每个候选的起始偏移也是 16 的倍数），所以可以放心用 16 字节一拷。
+ */
+GY_HOSTDEV inline void gy_copy16(void *dst, const void *src, int quads) {
+    uint4 *d = (uint4 *)dst;
+    const uint4 *s = (const uint4 *)src;
+    for (int i = 0; i < quads; i++) {
+        d[i] = s[i];
+    }
+}
+
+/*
+ * 流式（evict-first）访问提示。
+ *
+ * v 数组是纯流式的：每个条目写一次、读一次，之后再也不碰。
+ * 不用提示的话，这 16 MiB 的流量会把 L1 里每个候选私有的 12 KiB S 盒冲掉，
+ * 于是 pwxform 那几千万次随机查表全部落到 L2/DRAM，延迟高一个量级。
+ * 标成 evict-first 后，S 盒就能留在 L1 里。
+ *
+ * 这些提示只在设备端有意义；主机参考实现走普通访存（结果完全一致）。
+ */
+#ifdef __CUDA_ARCH__
+#define GY_STREAM_STORE(dst, val) __stcs((dst), (val))
+#define GY_STREAM_LOAD(ptr) (__ldcs((ptr)))
+#else
+#define GY_STREAM_STORE(dst, val) (*(dst) = (val))
+#define GY_STREAM_LOAD(ptr) (*(ptr))
+#endif
+
+/* 以流式提示按 16 字节拷贝。 */
+GY_HOSTDEV inline void gy_copy16_cs(void *dst, const void *src, int quads) {
+    uint4 *d = (uint4 *)dst;
+    const uint4 *s = (const uint4 *)src;
+    for (int i = 0; i < quads; i++) {
+        GY_STREAM_STORE(&d[i], s[i]);
+    }
+}
+
+/* 以流式提示按 16 字节异或（dst ^= src）。 */
+GY_HOSTDEV inline void gy_xor16_cs(void *dst, const void *src, int quads) {
+    uint4 *d = (uint4 *)dst;
+    const uint4 *s = (const uint4 *)src;
+    for (int i = 0; i < quads; i++) {
+        uint4 t = GY_STREAM_LOAD(&s[i]);
+        d[i].x ^= t.x;
+        d[i].y ^= t.y;
+        d[i].z ^= t.z;
+        d[i].w ^= t.w;
     }
 }
 
@@ -1202,6 +1263,597 @@ GY_HOSTDEV void gy_pbkdf2_sha256(const uint8_t *pw, int pwlen,
 /* WPA2 PMK / WinZip AES 的固定迭代次数。 */
 #define GY_WPA2_ITER 4096
 #define GY_ZIP_AES_ITER 1000
+
+/* ------------------------------------------------------------------ *
+ * 4b. yescrypt ($y$)                                                   *
+ * ------------------------------------------------------------------ */
+
+/*
+ * yescrypt（$y$）：与 go-crypt/x/yescrypt（源自 openwall/yescrypt-go）
+ * 以及 libxcrypt 的实现逐字节一致——本项目的 CPU 校验走前者，
+ * GPU 内核走这里，两边必须完全等价，否则同一个哈希会给出不同结论。
+ *
+ * 算法骨架（口令 → 32 字节派生密钥）：
+ *
+ *   pass0: pwHash = HMAC-SHA256("yescrypt-prehash", 口令)
+ *          B      = PBKDF2-HMAC-SHA256(pwHash, 盐, 1, 128*r)
+ *          pwHash = B[0:32]
+ *          B      = smix_pwxform(B, r, N/64)          // 同时生成 S 盒
+ *          key0   = PBKDF2-HMAC-SHA256(pwHash, B, 1, 32)
+ *
+ *   pass1: pwHash = HMAC-SHA256("yescrypt", key0)
+ *          B      = PBKDF2-HMAC-SHA256(pwHash, 盐, 1, 128*r)
+ *          pwHash = B[0:32]
+ *          B      = smix_pwxform(B, r, N)
+ *          key1   = PBKDF2-HMAC-SHA256(pwHash, B, 1, 32)
+ *          key    = SHA256(HMAC-SHA256(key1, "Client Key"))
+ *
+ * 内存硬性：每个候选要一块 16*N*r 个 uint64 的 v 数组
+ * （N=4096、r=32 时约 16 MiB）。GPU 上能同时跑的候选数因此被显存
+ * 卡死——这是算法本身的要求，不是实现取舍。
+ */
+
+/* pwxform 参数：设计期固定值，不允许随意改动 */
+#define GY_YS_PWX_SIMPLE 2
+#define GY_YS_PWX_GATHER 4
+#define GY_YS_PWX_ROUNDS 6
+#define GY_YS_SWIDTH 8
+#define GY_YS_PWX_WORDS (GY_YS_PWX_GATHER * GY_YS_PWX_SIMPLE)            /* 8 */
+#define GY_YS_PWX_BYTES (GY_YS_PWX_WORDS * 8)                           /* 64 */
+#define GY_YS_S_WORDS (3 * (1 << GY_YS_SWIDTH) * GY_YS_PWX_SIMPLE)       /* 1536 */
+#define GY_YS_S_BYTES (GY_YS_S_WORDS * 8)                                /* 12288 */
+#define GY_YS_SMASK (((1 << GY_YS_SWIDTH) - 1) * GY_YS_PWX_SIMPLE * 8)  /* 4080 */
+
+/*
+ * pwxform / salsa 的中间工作集：8 个 64 位字。
+ *
+ * 整块按值进出，而不是「局部数组 + 指针」：
+ * 局部数组在 GPU 上会落到本地内存，CUDA 给每个元素留 256 字节步长，
+ * 一 warp 的 32 个线程各有一份。pwxform 每次进出都要读写这 8 个字，
+ * 光这部分流量就和 S 盒查表一样大。按值传参则能全程留在寄存器里。
+ */
+typedef struct {
+    uint64_t w[GY_YS_PWX_WORDS];
+} gy_blk8;
+
+/*
+ * 8 个字（64 字节）按 128 位整体读写。
+ *
+ * 每个候选的 B 段彼此独立（线程之间指向不同候选），warp 内 32 个线程
+ * 各取各的地址，没法合并成一条指令；但 16 字节一次取回能覆盖半个
+ * cache line，取回的 sector 数与访存指令数都减半。
+ *
+ * 对齐要求：B 及其各处偏移都是 16 字节对齐的——工作区由 cudaMalloc /
+ * malloc 分配（≥16 字节对齐），vwords、xywords 都是偶数个字，
+ * 因此 xy 与 B 的基址天然 16 字节对齐，偏移也都是 64 字节的整数倍。
+ */
+GY_HOSTDEV inline void gy_blk8_load(gy_blk8 *X, const uint64_t *B) {
+    const longlong2 *p = (const longlong2 *)B;
+    longlong2 a = p[0], b = p[1], c = p[2], d = p[3];
+    X->w[0] = (uint64_t)a.x;
+    X->w[1] = (uint64_t)a.y;
+    X->w[2] = (uint64_t)b.x;
+    X->w[3] = (uint64_t)b.y;
+    X->w[4] = (uint64_t)c.x;
+    X->w[5] = (uint64_t)c.y;
+    X->w[6] = (uint64_t)d.x;
+    X->w[7] = (uint64_t)d.y;
+}
+
+/* X ^= B（逐块 64 字节） */
+GY_HOSTDEV inline void gy_blk8_xor(gy_blk8 *X, const uint64_t *B) {
+    const longlong2 *p = (const longlong2 *)B;
+    longlong2 a = p[0], b = p[1], c = p[2], d = p[3];
+    X->w[0] ^= (uint64_t)a.x;
+    X->w[1] ^= (uint64_t)a.y;
+    X->w[2] ^= (uint64_t)b.x;
+    X->w[3] ^= (uint64_t)b.y;
+    X->w[4] ^= (uint64_t)c.x;
+    X->w[5] ^= (uint64_t)c.y;
+    X->w[6] ^= (uint64_t)d.x;
+    X->w[7] ^= (uint64_t)d.y;
+}
+
+/* B = X */
+GY_HOSTDEV inline void gy_blk8_store(uint64_t *B, const gy_blk8 *X) {
+    longlong2 *p = (longlong2 *)B;
+    longlong2 a, b, c, d;
+    a.x = (long long)X->w[0];
+    a.y = (long long)X->w[1];
+    b.x = (long long)X->w[2];
+    b.y = (long long)X->w[3];
+    c.x = (long long)X->w[4];
+    c.y = (long long)X->w[5];
+    d.x = (long long)X->w[6];
+    d.y = (long long)X->w[7];
+    p[0] = a;
+    p[1] = b;
+    p[2] = c;
+    p[3] = d;
+}
+
+/* 参数上限：与 go-crypt/x/yescrypt 的 Hash() 一致 */
+#define GY_YS_MIN_NLOG2 10
+#define GY_YS_MAX_NLOG2 18
+#define GY_YS_MAX_R 32
+#define GY_YS_KEY_LEN 32
+/* 单次发射的候选数上限（真正的并发度由显存决定，这里只是兜底） */
+#define GY_YS_MAX_WAVE 4096
+/*
+ * yescrypt 内核的块大小：只用 32 个线程（一个 warp）。
+ *
+ * yescrypt 每波能跑的候选数被显存卡死（16 MiB/候选），4 GB 卡上只有一百多个，
+ * 用 256 线程的块会整波挤在一个 SM 上，十几张 SM 全闲着；
+ * 32 线程的块则能被调度器铺到不同的 SM 上，并发度直接翻几倍。
+ */
+#define GY_YS_BLOCK 32
+
+/* 小端读写（设备端逐字节，安全且与主机端一致） */
+GY_HOSTDEV inline uint32_t gy_load_le32(const uint8_t *p, int off) {
+    return (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) | ((uint32_t)p[off + 2] << 16) |
+           ((uint32_t)p[off + 3] << 24);
+}
+
+GY_HOSTDEV inline void gy_store_le32(uint8_t *p, int off, uint32_t v) {
+    p[off] = (uint8_t)v;
+    p[off + 1] = (uint8_t)(v >> 8);
+    p[off + 2] = (uint8_t)(v >> 16);
+    p[off + 3] = (uint8_t)(v >> 24);
+}
+
+GY_HOSTDEV inline uint32_t gy_rotl32(uint32_t x, int n) {
+    return (uint32_t)((x << n) | (x >> (32 - n)));
+}
+
+/*
+ * Salsa20/8 核心：tmp ^= in，然后做 ROUNDS/2 轮 Salsa20。
+ * 与 go-crypt/x/yescrypt 的 salsaXOR 逐字节一致（8 轮用于 blockMix，
+ * 2 轮用于 pwxform 路径的收尾混合）。
+ */
+template <int ROUNDS>
+GY_HOSTDEV gy_blk8 gy_salsa_xor(gy_blk8 tmp, const uint64_t in[8], uint64_t out[8]) {
+    uint64_t d0 = tmp.w[0] ^ in[0];
+    uint64_t d1 = tmp.w[1] ^ in[1];
+    uint64_t d2 = tmp.w[2] ^ in[2];
+    uint64_t d3 = tmp.w[3] ^ in[3];
+    uint64_t d4 = tmp.w[4] ^ in[4];
+    uint64_t d5 = tmp.w[5] ^ in[5];
+    uint64_t d6 = tmp.w[6] ^ in[6];
+    uint64_t d7 = tmp.w[7] ^ in[7];
+
+    uint32_t x0 = (uint32_t)d0,  x1 = (uint32_t)(d6 >> 32);
+    uint32_t x2 = (uint32_t)d5,  x3 = (uint32_t)(d3 >> 32);
+    uint32_t x4 = (uint32_t)d2,  x5 = (uint32_t)(d0 >> 32);
+    uint32_t x6 = (uint32_t)d7,  x7 = (uint32_t)(d5 >> 32);
+    uint32_t x8 = (uint32_t)d4,  x9 = (uint32_t)(d2 >> 32);
+    uint32_t x10 = (uint32_t)d1, x11 = (uint32_t)(d7 >> 32);
+    uint32_t x12 = (uint32_t)d6, x13 = (uint32_t)(d4 >> 32);
+    uint32_t x14 = (uint32_t)d3, x15 = (uint32_t)(d1 >> 32);
+
+    for (int i = 0; i < ROUNDS; i += 2) {
+        x4 ^= gy_rotl32(x0 + x12, 7);
+        x8 ^= gy_rotl32(x4 + x0, 9);
+        x12 ^= gy_rotl32(x8 + x4, 13);
+        x0 ^= gy_rotl32(x12 + x8, 18);
+
+        x9 ^= gy_rotl32(x5 + x1, 7);
+        x13 ^= gy_rotl32(x9 + x5, 9);
+        x1 ^= gy_rotl32(x13 + x9, 13);
+        x5 ^= gy_rotl32(x1 + x13, 18);
+
+        x14 ^= gy_rotl32(x10 + x6, 7);
+        x2 ^= gy_rotl32(x14 + x10, 9);
+        x6 ^= gy_rotl32(x2 + x14, 13);
+        x10 ^= gy_rotl32(x6 + x2, 18);
+
+        x3 ^= gy_rotl32(x15 + x11, 7);
+        x7 ^= gy_rotl32(x3 + x15, 9);
+        x11 ^= gy_rotl32(x7 + x3, 13);
+        x15 ^= gy_rotl32(x11 + x7, 18);
+
+        x1 ^= gy_rotl32(x0 + x3, 7);
+        x2 ^= gy_rotl32(x1 + x0, 9);
+        x3 ^= gy_rotl32(x2 + x1, 13);
+        x0 ^= gy_rotl32(x3 + x2, 18);
+
+        x6 ^= gy_rotl32(x5 + x4, 7);
+        x7 ^= gy_rotl32(x6 + x5, 9);
+        x4 ^= gy_rotl32(x7 + x6, 13);
+        x5 ^= gy_rotl32(x4 + x7, 18);
+
+        x11 ^= gy_rotl32(x10 + x9, 7);
+        x8 ^= gy_rotl32(x11 + x10, 9);
+        x9 ^= gy_rotl32(x8 + x11, 13);
+        x10 ^= gy_rotl32(x9 + x8, 18);
+
+        x12 ^= gy_rotl32(x15 + x14, 7);
+        x13 ^= gy_rotl32(x12 + x15, 9);
+        x14 ^= gy_rotl32(x13 + x12, 13);
+        x15 ^= gy_rotl32(x14 + x13, 18);
+    }
+
+    d0 = (uint64_t)(uint32_t)((uint32_t)d0 + x0) | ((uint64_t)(uint32_t)((uint32_t)(d0 >> 32) + x5) << 32);
+    d1 = (uint64_t)(uint32_t)((uint32_t)d1 + x10) | ((uint64_t)(uint32_t)((uint32_t)(d1 >> 32) + x15) << 32);
+    d2 = (uint64_t)(uint32_t)((uint32_t)d2 + x4) | ((uint64_t)(uint32_t)((uint32_t)(d2 >> 32) + x9) << 32);
+    d3 = (uint64_t)(uint32_t)((uint32_t)d3 + x14) | ((uint64_t)(uint32_t)((uint32_t)(d3 >> 32) + x3) << 32);
+    d4 = (uint64_t)(uint32_t)((uint32_t)d4 + x8) | ((uint64_t)(uint32_t)((uint32_t)(d4 >> 32) + x13) << 32);
+    d5 = (uint64_t)(uint32_t)((uint32_t)d5 + x2) | ((uint64_t)(uint32_t)((uint32_t)(d5 >> 32) + x7) << 32);
+    d6 = (uint64_t)(uint32_t)((uint32_t)d6 + x12) | ((uint64_t)(uint32_t)((uint32_t)(d6 >> 32) + x1) << 32);
+    d7 = (uint64_t)(uint32_t)((uint32_t)d7 + x6) | ((uint64_t)(uint32_t)((uint32_t)(d7 >> 32) + x11) << 32);
+
+    out[0] = tmp.w[0] = d0;
+    out[1] = tmp.w[1] = d1;
+    out[2] = tmp.w[2] = d2;
+    out[3] = tmp.w[3] = d3;
+    out[4] = tmp.w[4] = d4;
+    out[5] = tmp.w[5] = d5;
+    out[6] = tmp.w[6] = d6;
+    out[7] = tmp.w[7] = d7;
+    return tmp;
+}
+
+/* 纯 scrypt 的 blockMix（生成 S 盒时用） */
+template <int ROUNDS>
+GY_HOSTDEV void gy_block_mix(gy_blk8 tmp, const uint64_t *in, uint64_t *out, int r) {
+    for (int i = 0; i < 8; i++) {
+        tmp.w[i] = in[(2 * r - 1) * 8 + i];
+    }
+    for (int i = 0; i < 2 * r; i += 2) {
+        tmp = gy_salsa_xor<ROUNDS>(tmp, in + i * 8, out + i * 4);
+        tmp = gy_salsa_xor<ROUNDS>(tmp, in + i * 8 + 8, out + i * 4 + r * 8);
+    }
+}
+
+/* pwxform 的 S 盒上下文：S0/S1/S2 是同一块 1536 个 uint64 的三个视图 */
+typedef struct {
+    uint64_t *S0;
+    uint64_t *S1;
+    uint64_t *S2;
+    uint32_t w;
+} gy_pwxform_ctx;
+
+/*
+ * pwxform：yescrypt 的核心非线性混合。每轮从 S 盒取两个表项做乘法与异或，
+ * 再把结果回写 S2（首末两轮除外）。
+ *
+ * 一轮里的 4 个 gather 互不依赖（各自只读 X 的两个字、写自己的两个字），
+ * 所以这里拆成「先发全部载入、再做运算」两段：16 次随机查表同时在飞，
+ * 内存延迟被摊薄，而不是一次一个地等。
+ * （S0/S1/S2 指向同一块 S 盒的三个互不重叠的区段，__restrict__ 是安全的。）
+ */
+GY_HOSTDEV gy_blk8 gy_pwxform(gy_blk8 X, gy_pwxform_ctx *__restrict__ ctx) {
+    uint64_t *__restrict__ S0 = ctx->S0;
+    uint64_t *__restrict__ S1 = ctx->S1;
+    uint64_t *__restrict__ S2 = ctx->S2;
+    uint32_t w = ctx->w;
+
+    for (int i = 0; i < GY_YS_PWX_ROUNDS; i++) {
+        uint64_t xa[GY_YS_PWX_GATHER], ya[GY_YS_PWX_GATHER];
+        uint64_t s0a[GY_YS_PWX_GATHER], s1a[GY_YS_PWX_GATHER];
+        uint64_t s0b[GY_YS_PWX_GATHER], s1b[GY_YS_PWX_GATHER];
+
+        /* 载入阶段：4 个 gather 的 16 次随机查表一起发出去 */
+        for (int j = 0; j < GY_YS_PWX_GATHER; j++) {
+            uint64_t x = X.w[j * GY_YS_PWX_SIMPLE];
+            uint32_t xl = (uint32_t)x;
+            uint32_t xh = (uint32_t)(x >> 32);
+            x = (uint64_t)xh * (uint64_t)xl;
+            xl = (xl & GY_YS_SMASK) / 8;
+            xh = (xh & GY_YS_SMASK) / 8;
+            uint64_t y = X.w[j * GY_YS_PWX_SIMPLE + 1];
+            uint64_t ym = ((y >> 32) * (uint64_t)(uint32_t)y);
+
+            xa[j] = x;
+            ya[j] = ym;
+            /*
+             * S0[xl] 与 S0[xl+1] 是相邻的两个 64 位字，S1 同理。
+             * 用 128 位一次取回，访存指令数直接减半——查表是内核最大的开销。
+             *
+             * 对齐是天然成立的：下标由 (值 & 4080) / 8 得到，4080 是 16 的倍数，
+             * 所以下标必为偶数；S0/S1 又分别落在 16 字节对齐的边界上
+             * （S 缓冲按 512 字一段切分，每段 4096 字节）。
+             *
+             * 这里必须用 longlong2 而不是 uint4：uint4 的四个成员都是 32 位
+             * unsigned int，取出来的低/高 64 位表项会被截掉一半。longlong2
+             * 正好是「两个 64 位字 + 16 字节对齐」，一次 LDG.E.128 拿回两词。
+             */
+            const longlong2 *p0 = (const longlong2 *)(S0 + xl);
+            const longlong2 *p1 = (const longlong2 *)(S1 + xh);
+            longlong2 v0 = *p0;
+            longlong2 v1 = *p1;
+            s0a[j] = (uint64_t)v0.x;
+            s0b[j] = (uint64_t)v0.y;
+            s1a[j] = (uint64_t)v1.x;
+            s1b[j] = (uint64_t)v1.y;
+        }
+
+        /* 运算阶段：把查回来的表项混进去，并按需回写 S2 */
+        for (int j = 0; j < GY_YS_PWX_GATHER; j++) {
+            uint64_t x = (xa[j] + s0a[j]) ^ s1a[j];
+            uint64_t y = (ya[j] + s0b[j]) ^ s1b[j];
+            X.w[j * GY_YS_PWX_SIMPLE] = x;
+            X.w[j * GY_YS_PWX_SIMPLE + 1] = y;
+            if (i != 0 && i != GY_YS_PWX_ROUNDS - 1) {
+                /*
+                 * S2[w] 与 S2[w+1] 相邻，w 从 0 起每次加 2，恒为偶数；
+                 * S2 又落在 16 字节对齐的区段边界上 —— 两条 64 位写可以
+                 * 合并成一条 128 位写，pwxform 的写指令数直接减半。
+                 */
+                longlong2 sv;
+                sv.x = (long long)x;
+                sv.y = (long long)y;
+                *(longlong2 *)(S2 + w) = sv;
+                w += 2;
+            }
+        }
+    }
+
+    ctx->S0 = S2;
+    ctx->S1 = S0;
+    ctx->S2 = S1;
+    ctx->w = w & (((1 << GY_YS_SWIDTH) * GY_YS_PWX_SIMPLE) - 1);
+    return X;
+}
+
+/*
+ * yescrypt 的 blockMix：pwxform 取代 Salsa20，并按 64 字节块置换。
+ *
+ * B 既是输入也是输出（就地修改）。Go 参考实现里还有一个独立的累加器 X，
+ * 它在函数返回后就被丢弃，因此这里直接用局部 tmp 承担同样的角色。
+ */
+GY_HOSTDEV void gy_block_mix_pwxform(uint64_t *B, int r, gy_pwxform_ctx *ctx) {
+    const int r1 = 128 * r / GY_YS_PWX_BYTES; /* = 2*r */
+    gy_blk8 tmp;
+
+    gy_blk8_load(&tmp, B + (r1 - 1) * GY_YS_PWX_WORDS);
+    for (int i = 0; i < r1; i++) {
+        gy_blk8_xor(&tmp, B + i * GY_YS_PWX_WORDS);
+        tmp = gy_pwxform(tmp, ctx);
+        gy_blk8_store(B + i * GY_YS_PWX_WORDS, &tmp);
+    }
+    const int i2 = (r1 - 1) * GY_YS_PWX_BYTES / 64;
+    for (int i = 0; i < GY_YS_PWX_WORDS; i++) {
+        tmp.w[i] = 0;
+    }
+    /* in 与 out 同址：salsa 内部先把 in 全部读进寄存器再写回，安全 */
+    tmp = gy_salsa_xor<2>(tmp, B + i2 * GY_YS_PWX_WORDS, B + i2 * GY_YS_PWX_WORDS);
+}
+
+/* 整数取值：取 x 的第 (2*r-1) 个字的低 32 位 */
+GY_HOSTDEV inline uint32_t gy_integer(const uint64_t *x, int r) {
+    return (uint32_t)x[(2 * r - 1) * 8];
+}
+
+/* 不大于 x 的最大 2 的幂 */
+GY_HOSTDEV inline uint32_t gy_p2floor(uint32_t x) {
+    while (x & (x - 1)) {
+        x &= x - 1;
+    }
+    return x;
+}
+
+/* yescrypt 首轮使用的“折叠”索引 */
+GY_HOSTDEV inline uint32_t gy_wrap(uint32_t x, uint32_t i) {
+    uint32_t n = gy_p2floor(i);
+    return (x & (n - 1)) + (i - n);
+}
+
+/*
+ * 从 b 读出初始块 / 写回结果：scrypt 经典的 64 字节块内置换。
+ * 下标 (j & ~63) | ((j*5) & 63) 是一个块内置换，恒在 b 的范围内。
+ */
+GY_HOSTDEV void gy_block_shuffle_in(const uint8_t *b, uint64_t *x, int R) {
+    int j = 0;
+    for (int i = 0; i < R; i++) {
+        uint32_t lo = gy_load_le32(b, (j & ~63) | ((j * 5) & 63));
+        j += 4;
+        uint32_t hi = gy_load_le32(b, (j & ~63) | ((j * 5) & 63));
+        j += 4;
+        x[i] = (uint64_t)lo | ((uint64_t)hi << 32);
+    }
+}
+
+GY_HOSTDEV void gy_block_shuffle_out(uint8_t *b, const uint64_t *x, int R) {
+    int j = 0;
+    for (int i = 0; i < R; i++) {
+        gy_store_le32(b, (j & ~63) | ((j * 5) & 63), (uint32_t)x[i]);
+        j += 4;
+        gy_store_le32(b, (j & ~63) | ((j * 5) & 63), (uint32_t)(x[i] >> 32));
+        j += 4;
+    }
+}
+
+/* 纯 scrypt 混洗：只用于从 B 生成 S 盒（r=1、N=96） */
+GY_HOSTDEV void gy_smix_plain(uint8_t *b, int r, int N, int Nloop, uint64_t *v, uint64_t *xy) {
+    const int R = 16 * r;
+    uint64_t *x = xy;
+    uint64_t *y = xy + R;
+    gy_blk8 tmp;
+
+    gy_block_shuffle_in(b, x, R);
+
+    for (int i = 0; i < N; i += 2) {
+        gy_copy16(v + (size_t)i * R, x, R / 2);
+        gy_block_mix<8>(tmp, x, y, r);
+        gy_copy16(v + (size_t)(i + 1) * R, y, R / 2);
+        gy_block_mix<8>(tmp, y, x, r);
+    }
+    for (int i = 0; i < Nloop; i += 2) {
+        size_t j1 = (size_t)(gy_integer(x, r) & (uint32_t)(N - 1));
+        for (int k = 0; k < R; k++) {
+            x[k] ^= v[j1 * R + k];
+        }
+        gy_block_mix<8>(tmp, x, y, r);
+        size_t j2 = (size_t)(gy_integer(y, r) & (uint32_t)(N - 1));
+        for (int k = 0; k < R; k++) {
+            y[k] ^= v[j2 * R + k];
+        }
+        gy_block_mix<8>(tmp, y, x, r);
+    }
+
+    gy_block_shuffle_out(b, x, R);
+}
+
+/* yescrypt 混洗：带 pwxform 的 ROMix */
+GY_HOSTDEV void gy_smix_pwxform(uint8_t *b, int r, int N, int Nloop, uint64_t *v, uint64_t *xy,
+                                 gy_pwxform_ctx *ctx) {
+    const int R = 16 * r;
+    uint64_t *x = xy;
+
+    gy_block_shuffle_in(b, x, R);
+
+    for (int i = 0; i < N; i++) {
+        gy_copy16_cs(v + (size_t)i * R, x, R / 2);
+        if (i > 1) {
+            size_t j = (size_t)gy_wrap(gy_integer(x, r), (uint32_t)i);
+            for (int k = 0; k < R; k++) {
+                x[k] ^= v[j * R + k];
+            }
+        }
+        gy_block_mix_pwxform(x, r, ctx);
+    }
+    for (int i = 0; i < Nloop; i++) {
+        size_t j = (size_t)(gy_integer(x, r) & (uint32_t)(N - 1));
+        gy_xor16_cs(x, v + j * R, R / 2);
+        gy_copy16_cs(v + j * R, x, R / 2);
+        gy_block_mix_pwxform(x, r, ctx);
+    }
+
+    gy_block_shuffle_out(b, x, R);
+}
+
+/* 单个候选工作区的字节数（v + xy + S + b，全部连续排布）。 */
+GY_HOSTDEV inline size_t gy_ys_workspace_bytes(int nlog2, int r) {
+    uint64_t N = (uint64_t)1 << nlog2;
+    size_t vwords = (size_t)16 * N * (size_t)r;
+    size_t xywords = (size_t)16 * (r > 2 ? r : 2);
+    return (vwords + xywords + GY_YS_S_WORDS) * sizeof(uint64_t) + (size_t)128 * (size_t)r;
+}
+
+/*
+ * gy_ys_workspace — 把一个候选的工作区切成四段。
+ *
+ * 布局: [v][xy][S][b]，全部连续排布。连续排布对 S 盒尤其重要：
+ * 见 gy_yescrypt_derive 的注释（局部数组的 256 字节步长会毁掉 cache 命中）。
+ */
+GY_HOSTDEV inline void gy_ys_workspace(int nlog2, int r, uint64_t *base,
+                                       uint64_t **v, uint64_t **xy, uint64_t **S, uint8_t **b) {
+    uint64_t N = (uint64_t)1 << nlog2;
+    size_t vwords = (size_t)16 * N * (size_t)r;
+    size_t xywords = (size_t)16 * (r > 2 ? r : 2);
+    *v = base;
+    *xy = base + vwords;
+    *S = base + vwords + xywords;
+    *b = (uint8_t *)(base + vwords + xywords + GY_YS_S_WORDS);
+}
+
+/*
+ * gy_smix_yescrypt — 由 B 生成 S 盒，然后把口令摘要再过一遍 HMAC，最后做 pwxform 混洗。
+ * passwordSha256 会被就地改写（与 go-crypt/x 的行为一致）。
+ *
+ * S 由调用方提供（GY_YS_S_WORDS 个 uint64 的工作区）。
+ */
+GY_HOSTDEV void gy_smix_yescrypt(uint8_t *b, int r, int N, uint64_t *v, uint64_t *xy,
+                                  uint64_t *S, uint8_t passwordSha256[32]) {
+    gy_pwxform_ctx ctx;
+
+    /* S 盒：由 B 经一次纯 scrypt 混洗得到（SHA-512 ROM 的等价物） */
+    gy_smix_plain(b, 1, GY_YS_S_BYTES / 128, 0, S, xy);
+
+    ctx.S2 = S;
+    ctx.S1 = S + GY_YS_S_WORDS / 3;
+    ctx.S0 = S + (GY_YS_S_WORDS / 3) * 2;
+    ctx.w = 0;
+
+    /* 口令摘要再绑一次 B 的尾部 64 字节 */
+    gy_hmac_sha256(b + 64 * (2 * r - 1), 64, passwordSha256, 32, passwordSha256);
+
+    gy_smix_pwxform(b, r, N, ((N + 2) / 3 + 1) & ~1, v, xy, &ctx);
+}
+
+/*
+ * gy_yescrypt_derive — 口令 → 32 字节派生密钥。
+ *
+ * 工作区由调用方分配，全部放在**连续的全局显存**里，而不是局部数组：
+ *
+ *   v   16*N*r 个 uint64（N = 1<<nlog2）
+ *   xy  16*max(r,2) 个 uint64
+ *   S   GY_YS_S_WORDS 个 uint64
+ *   b   128*r 字节
+ *
+ * 为什么不用局部数组（__local__）：CUDA 给局部数组分配的步长是每个元素
+ * 256 字节（为了避开 bank conflict），于是 12 KiB 的 S 盒会摊到约
+ * 192 KiB 的 cache line 上——有效数据只占十六分之一，pwxform 那几千万次
+ * 随机查表全部变成 cache miss，GPU 会比 CPU 慢一个数量级。
+ * 改成在全局显存里连续排布后，S 盒紧凑占 12 KiB（96 条 line），
+ * 随机查表重新落回 L1/L2。
+ *
+ * out 接收 32 字节派生密钥。
+ */
+GY_HOSTDEV int gy_yescrypt_derive(const uint8_t *pw, int pwlen,
+                                   const uint8_t *salt, int saltlen,
+                                   int nlog2, int r,
+                                   uint64_t *v, uint64_t *xy, uint64_t *S, uint8_t *b,
+                                   uint8_t out[32]) {
+    if (nlog2 < GY_YS_MIN_NLOG2 || nlog2 > GY_YS_MAX_NLOG2 || r < 1 || r > GY_YS_MAX_R) {
+        return -1;
+    }
+    if (pwlen < 0 || pwlen > GY_MAX_PW || saltlen < 0 || saltlen > GY_MAX_SALT) {
+        return -1;
+    }
+
+    uint64_t N = (uint64_t)1 << nlog2;
+    uint8_t pwsha[32];
+    uint8_t key[32];
+    uint8_t h1[32], h2[32];
+
+    /* 与 go-crypt/x/yescrypt 的 deriveKey 一致：大参数时多跑一轮 pass0 */
+    int pass = 1;
+    if (N >= 0x100 && N * (uint64_t)r >= 0x20000) {
+        pass = 0;
+        N >>= 6;
+    }
+
+    const uint8_t *prehash = (const uint8_t *)"yescrypt-prehash";
+    int prehashlen = 16;
+    const uint8_t *in = pw;
+    int inlen = pwlen;
+
+    for (; pass <= 1; pass++) {
+        if (pass == 1) {
+            prehash = (const uint8_t *)"yescrypt";
+            prehashlen = 8;
+        }
+
+        /* pwsha = HMAC-SHA256(prehash, in) */
+        gy_hmac_sha256(prehash, prehashlen, in, inlen, pwsha);
+
+        /* B = PBKDF2-HMAC-SHA256(pwsha, salt, 1, 128*r) */
+        gy_pbkdf2_sha256(pwsha, 32, salt, saltlen, 1, b, 128 * r);
+
+        /* 口令摘要换成 B 的前 32 字节 */
+        gy_copy(pwsha, b, 32);
+
+        gy_smix_yescrypt(b, r, (int)N, v, xy, S, pwsha);
+
+        /* key = PBKDF2-HMAC-SHA256(pwsha, B, 1, 32) */
+        gy_pbkdf2_sha256(pwsha, 32, b, 128 * r, 1, key, 32);
+
+        if (pass == 0) {
+            gy_copy(pwsha, key, 32);
+            N <<= 6;
+            in = pwsha;
+            inlen = 32;
+        } else {
+            gy_hmac_sha256(key, 32, (const uint8_t *)"Client Key", 10, h1);
+            gy_sha256_fixed(h1, 32, h2);
+            gy_copy(key, h2, 32);
+        }
+    }
+
+    gy_copy(out, key, 32);
+    return 0;
+}
 
 /* ============================ RAR3 交织 SHA-1 ============================ */
 
@@ -2671,6 +3323,42 @@ __global__ void gy_verify_kernel(int algo, const char *pw_data, const int *pw_of
     }
 }
 
+/*
+ * yescrypt($y$)：一个线程 = 一个候选密码。
+ *
+ * 每个线程独占一块 v 数组（16*N*r 个 uint64），这是 yescrypt 的内存硬性要求，
+ * 因此并发候选数由显存决定，而不是由 SM 数量决定。
+ */
+__global__ void gy_verify_yescrypt_kernel(int nlog2, int r,
+                                          const char *pw_data, const int *pw_off,
+                                          const int *pw_len, int count,
+                                          const uint8_t *salt, int salt_len,
+                                          const uint8_t *key32,
+                                          uint64_t *ws, size_t ws_bytes,
+                                          int *match) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+
+    const char *pw = pw_data + pw_off[i];
+    int n = pw_len[i];
+
+    uint64_t *v, *xy, *S;
+    uint8_t *b;
+    gy_ys_workspace(nlog2, r, ws + (size_t)i * (ws_bytes / sizeof(uint64_t)), &v, &xy, &S, &b);
+
+    uint8_t derived[32];
+
+    if (gy_yescrypt_derive((const uint8_t *)pw, n, salt, salt_len, nlog2, r,
+                           v, xy, S, b, derived) != 0) {
+        return;
+    }
+    if (gy_memeq(derived, key32, GY_YS_KEY_LEN)) {
+        atomicMin(match, i);
+    }
+}
+
 /* 通用哈希（hashac）：一个线程 = 一个候选密码，命中用 atomicMin 记录最小下标 */
 __global__ void gy_verify_hash_kernel(int algo, const char *pw_data, const int *pw_off,
                                       const int *pw_len, int count,
@@ -2797,6 +3485,246 @@ int gyhost_cuda_check_host(int algo, const char *pw, int pw_len,
         return gy_shacrypt_check<GySHA256Policy>(pw, pw_len, salt, salt_len, rounds, key);
     }
     return gy_shacrypt_check<GySHA512Policy>(pw, pw_len, salt, salt_len, rounds, key);
+}
+
+/*
+ * gyhost_cuda_check_yescrypt — yescrypt 的主机端（CPU）参考实现。
+ *
+ * 与 GPU 内核共用 cuda.cu 里的同一套算法代码，用于一致性自检与调试。
+ * 返回 1 命中 / 0 未命中 / 负数错误码。
+ *
+ * nlog2   N = 1<<nlog2（10..18）
+ * r       块大小因子（1..32）
+ * salt    解码后的盐字节（<= 64 字节）
+ * key32   目标派生密钥（32 字节）
+ */
+int gyhost_cuda_check_yescrypt(int nlog2, int r, const char *pw, int pw_len,
+                               const uint8_t *salt, int salt_len,
+                               const uint8_t *key32) {
+    if (pw == NULL || salt == NULL || key32 == NULL) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (nlog2 < GY_YS_MIN_NLOG2 || nlog2 > GY_YS_MAX_NLOG2) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (r < 1 || r > GY_YS_MAX_R) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (pw_len < 0 || pw_len > GY_MAX_PW || salt_len < 0 || salt_len > GY_MAX_SALT) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+
+    const size_t ws_bytes = gy_ys_workspace_bytes(nlog2, r);
+    uint64_t *ws = (uint64_t *)malloc(ws_bytes);
+    if (ws == NULL) {
+        return GYHOST_CUDA_ERR_ALLOC;
+    }
+    uint64_t *v, *xy, *S;
+    uint8_t *b;
+    gy_ys_workspace(nlog2, r, ws, &v, &xy, &S, &b);
+    uint8_t derived[32];
+
+    int rc = gy_yescrypt_derive((const uint8_t *)pw, pw_len, salt, salt_len, nlog2, r,
+                                 v, xy, S, b, derived);
+    free(ws);
+    if (rc != 0) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    return gy_memeq(derived, key32, GY_YS_KEY_LEN);
+}
+
+/*
+ * gyhost_cuda_verify_yescrypt — yescrypt 的批量校验（GPU）。
+ *
+ * 一批候选共享同一个目标哈希（盐/参数/目标密钥固定）。
+ *
+ * 并发度由显存决定：每个候选要独占一块 16*N*r 个 uint64 的 v 数组
+ * （N=4096、r=32 时约 16 MiB），因此这里按显存算出「一批能塞下多少候选」，
+ * 再分波发射；命中则按候选顺序取最小下标。
+ *
+ * 显存不足（连一个候选都放不下）时返回 GYHOST_CUDA_ERR_ALLOC，
+ * 调用方应回退 CPU 校验。
+ */
+/*
+ * gy_ys_wave_size — 一次能并发校验多少个 yescrypt 候选（受空闲显存限制）。
+ *
+ * 每个候选要独占一块 16·N·r 字节的工作区，所以并发数由显存决定而不是算力决定。
+ * 留四分之一给驱动与其它占用。
+ *
+ * 调用方分块下发时，块大小不应小于这个值：yescrypt 内核是「一线程一候选」，
+ * 耗时由最慢的一个 warp 决定，块变小并不会更快，只会把并发度白白扔掉
+ * （实测块从 178 降到 40，吞吐掉了 4 倍）。
+ */
+static int gy_ys_wave_size(int nlog2, int r, int device) {
+    int rc = gyhost_cuda_set_device(device);
+    if (rc != GYHOST_CUDA_OK) {
+        return rc;
+    }
+    const size_t ws_bytes = gy_ys_workspace_bytes(nlog2, r);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        cudaGetLastError();
+        return GYHOST_CUDA_ERR_ALLOC;
+    }
+    size_t budget = free_b - free_b / 4;
+    size_t wave = budget / ws_bytes;
+    if (wave < 1) {
+        return GYHOST_CUDA_ERR_ALLOC; /* 连一个候选的工作区都放不下 */
+    }
+    if (wave > (size_t)GY_YS_MAX_WAVE) {
+        wave = (size_t)GY_YS_MAX_WAVE;
+    }
+    return (int)wave;
+}
+
+/*
+ * gyhost_cuda_yescrypt_wave — 一次能并发校验多少个 yescrypt 候选。
+ *
+ * 供调用方决定分块大小：块不应小于这个值，否则等于主动丢掉 GPU 并发度。
+ * 返回负数表示出错（没有设备 / 连一个候选都放不下）。
+ */
+int gyhost_cuda_yescrypt_wave(int nlog2, int r, int device) {
+    if (nlog2 < GY_YS_MIN_NLOG2 || nlog2 > GY_YS_MAX_NLOG2) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (r < 1 || r > GY_YS_MAX_R) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    return gy_ys_wave_size(nlog2, r, device);
+}
+
+/*
+ * gyhost_cuda_chunk — 一次内核发射处理的候选数（crypt 路径）。
+ *
+ * 与 GY_CHUNK 保持一致：调用方分块下发时块不应小于它，否则等于白白丢掉并发度。
+ */
+int gyhost_cuda_chunk(void) { return GY_CHUNK; }
+
+int gyhost_cuda_verify_yescrypt(int nlog2, int r,
+                                const char *pw_data, int pw_total,
+                                const int *pw_off, const int *pw_len, int count,
+                                const uint8_t *salt, int salt_len,
+                                const uint8_t *key32, int device, int *match) {
+    if (pw_data == NULL || pw_off == NULL || pw_len == NULL || salt == NULL ||
+        key32 == NULL || match == NULL) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (count <= 0 || count > (1 << 20)) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (nlog2 < GY_YS_MIN_NLOG2 || nlog2 > GY_YS_MAX_NLOG2) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (r < 1 || r > GY_YS_MAX_R) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    if (pw_total < 0 || salt_len < 0 || salt_len > GY_MAX_SALT) {
+        return GYHOST_CUDA_ERR_PARAM;
+    }
+    for (int i = 0; i < count; i++) {
+        if (pw_len[i] < 0 || pw_len[i] > GY_MAX_PW) {
+            return GYHOST_CUDA_ERR_PARAM;
+        }
+        if (pw_off[i] < 0 || pw_off[i] > pw_total - pw_len[i]) {
+            return GYHOST_CUDA_ERR_PARAM;
+        }
+    }
+
+    int rc = gyhost_cuda_set_device(device);
+    if (rc != GYHOST_CUDA_OK) {
+        return rc;
+    }
+    cudaGetLastError();
+
+    /* 每个候选的工作区：v 数组 + xy + S 盒 + B 缓冲 */
+    const size_t ws_bytes = gy_ys_workspace_bytes(nlog2, r);
+
+    /* 按显存算并发候选数：留四分之一给驱动与其它占用 */
+    int wave_rc = gy_ys_wave_size(nlog2, r, device);
+    if (wave_rc < 0) {
+        return wave_rc;
+    }
+    size_t wave = (size_t)wave_rc;
+    if (wave > (size_t)count) {
+        wave = (size_t)count;
+    }
+
+    const size_t pw_bytes = (size_t)(pw_total > 0 ? pw_total : 1);
+    const size_t salt_bytes = (size_t)(salt_len > 0 ? salt_len : 1);
+    const size_t off_bytes = (size_t)count * sizeof(int);
+
+    char *d_pw = NULL;
+    int *d_off = NULL;
+    int *d_len = NULL;
+    uint8_t *d_salt = NULL;
+    int *d_match = NULL;
+    uint64_t *d_ws = NULL;
+    int best = count;
+    int rc_err = GYHOST_CUDA_OK;
+
+    if (cudaMalloc(&d_pw, pw_bytes) != cudaSuccess ||
+        cudaMalloc(&d_off, off_bytes) != cudaSuccess ||
+        cudaMalloc(&d_len, off_bytes) != cudaSuccess ||
+        cudaMalloc(&d_salt, salt_bytes) != cudaSuccess ||
+        cudaMalloc(&d_match, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&d_ws, wave * ws_bytes) != cudaSuccess) {
+        rc_err = GYHOST_CUDA_ERR_ALLOC;
+    } else if (cudaMemcpy(d_pw, pw_data, pw_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+               cudaMemcpy(d_off, pw_off, off_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+               cudaMemcpy(d_len, pw_len, off_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+               cudaMemcpy(d_salt, salt, salt_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        rc_err = GYHOST_CUDA_ERR_ALLOC;
+    } else {
+        /* 分波发射：每波最多 wave 个候选（受显存限制），命中即停 */
+        for (size_t base = 0; base < (size_t)count && rc_err == GYHOST_CUDA_OK; base += wave) {
+            size_t n = (size_t)count - base;
+            if (n > wave) {
+                n = wave;
+            }
+            int sentinel = (int)n; /* 无命中时保持为 n */
+
+            if (cudaMemcpy(d_match, &sentinel, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+                rc_err = GYHOST_CUDA_ERR_ALLOC;
+                break;
+            }
+
+            dim3 block(GY_YS_BLOCK);
+            dim3 grid((unsigned int)((n + GY_YS_BLOCK - 1) / GY_YS_BLOCK));
+            gy_verify_yescrypt_kernel<<<grid, block>>>(nlog2, r, d_pw, d_off + base, d_len + base,
+                                                      (int)n, d_salt, salt_len, key32,
+                                                      d_ws, ws_bytes, d_match);
+
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                rc_err = GYHOST_CUDA_ERR_KERNEL;
+                break;
+            }
+            /* DeviceToHost 拷贝会同步设备并带回内核的异步错误 */
+            if (cudaMemcpy(&sentinel, d_match, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                rc_err = GYHOST_CUDA_ERR_KERNEL;
+                break;
+            }
+            if (sentinel < (int)n) {
+                best = (int)base + sentinel;
+                break; /* 分波按顺序处理，首个命中的波即含最小子标 */
+            }
+        }
+    }
+
+    if (d_pw != NULL) cudaFree(d_pw);
+    if (d_off != NULL) cudaFree(d_off);
+    if (d_len != NULL) cudaFree(d_len);
+    if (d_salt != NULL) cudaFree(d_salt);
+    if (d_match != NULL) cudaFree(d_match);
+    if (d_ws != NULL) cudaFree(d_ws);
+
+    if (rc_err != GYHOST_CUDA_OK) {
+        cudaGetLastError();
+        return rc_err;
+    }
+
+    *match = (best < count) ? best : -1;
+    return GYHOST_CUDA_OK;
 }
 
 int gyhost_cuda_verify(int algo, const char *pw_data, int pw_total,
