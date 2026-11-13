@@ -22,8 +22,8 @@ import (
 
 // 全部颜色样式（与 freeclient 配色一致）。
 var (
-	// StyleArt 横幅艺术字：亮蓝粗体。
-	StyleArt = color.New(color.FgHiBlue, color.Bold)
+	// StyleArt 横幅艺术字：亮青粗体（与 GYscan/Client 的 logo 退化为同一配色）。
+	StyleArt = color.New(color.FgHiCyan, color.Bold)
 	// StyleSuccess 成功/命中：绿粗体。
 	StyleSuccess = color.New(color.FgGreen, color.Bold)
 	// StyleWarn 警告/跳过：黄粗体。

@@ -11,7 +11,7 @@ package i18n
 var procMessages = map[Lang]map[string]string{
 	Zh: {
 		"proc.group":                   "进程分析",
-		"proc.summary":                 "进程分析：进程列表、父子树、命令行、环境变量、打开的文件与资源占用（Linux/macOS）",
+		"proc.summary":                 "进程、线程与资源分析",
 		"proc.flag.input":              "目标进程：PID、self（当前进程）或程序名（程序名需配合 -a detail/thread）",
 		"proc.flag.action":             "要执行的动作，逗号分隔可重复（list/tree/user/thread/detail/all）",
 		"proc.flag.filter":             "只保留名字或命令行含该关键字的进程",
@@ -196,7 +196,7 @@ var procMessages = map[Lang]map[string]string{
 	},
 	En: {
 		"proc.group":                   "Process Analysis",
-		"proc.summary":                 "Process analysis: list, parent/child tree, command line, env, open files and resource usage (Linux/macOS)",
+		"proc.summary":                 "Process, thread and resource analysis",
 		"proc.flag.input":              "target process: PID, self, or a program name (a name requires -a detail/thread)",
 		"proc.flag.action":             "actions to run, comma separated and repeatable (list/tree/user/thread/detail/all)",
 		"proc.flag.filter":             "only keep processes whose name or command line contains this keyword",

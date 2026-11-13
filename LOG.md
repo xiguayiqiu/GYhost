@@ -32,6 +32,12 @@
 
 ### 变更
 
+- **CLI 界面与 GYscan/Client 对齐**：启动横幅改为渐变 ASCII 艺术字 + 洋红信息块，
+  根帮助改用 `Usage:` / `Available Commands:` / `Flags:` 标题，彩色分组标题
+  （`[ 分组 ]` + 灰色分隔线 + 15 列命令名），每组带一句灰色提示；
+  版本输出统一为 `GYhost version vX.Y.Z`。
+- **新增 `--lang zh|en` 全局参数**：显式切换界面语言，缺省仍按 `GYHOST_LANG` /
+  `LC_ALL` / `LANG` / `LANGUAGE` 探测；`-V` 与 `-v` 都可用于显示版本。
 - **`hashcat` 给出 `$y$` yescrypt 的模式号**：`$y$` 现在映射到 `-m 36100`
   （hashcat v8.0.0 新增的原生模式）。此前按「无原生模式」只显示算法名，
   `--list` 对照表也同步更新。

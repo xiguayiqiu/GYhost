@@ -1,8 +1,8 @@
 // Package i18n 提供极简国际化能力。
 //
 // 设计约定：
-//   - 语言只由环境变量 LANG 决定（zh* → 中文；en* → 英文；C/POSIX/未设置 → 默认中文；
-//     其它语言回退到英文），不引入其它环境变量或命令行开关。
+//   - 语言由 --lang 显式指定；未指定时依次探测 GYHOST_LANG、LC_ALL、LANG、LANGUAGE
+//     （zh* → 中文；en* → 英文；其它或未设置 → 默认中文）。
 //   - 所有面向用户的可见文案以 key 的形式登记在本包的 messages 表中，
 //     程序里一律通过 T / Tf 获取，不允许在业务代码里硬编码中文。
 //   - 某语言缺少 key 时依次回退：当前语言 → 默认语言 → 英文 → 返回 key 本身。
@@ -25,8 +25,11 @@ const (
 	En Lang = "en"
 )
 
-// DefaultLang 默认语言：LANG 缺失或为 C/POSIX 时使用。
+// DefaultLang 默认语言：未探测到受支持的语言时使用。
 const DefaultLang = Zh
+
+// EnvKey 显式指定语言的环境变量名（命令行 --lang 优先于它）。
+const EnvKey = "GYHOST_LANG"
 
 var (
 	mu      sync.RWMutex
@@ -37,16 +40,33 @@ func init() {
 	current = Detect()
 }
 
-// Detect 读取 LANG 环境变量判定语言。
+// Detect 按优先级探测语言：
+//  1. 环境变量 GYHOST_LANG
+//  2. 系统环境变量 LC_ALL / LANG / LANGUAGE
+//
+// 都不支持时回退到 DefaultLang。
 func Detect() Lang {
-	lang := strings.ToLower(strings.TrimSpace(os.Getenv("LANG")))
+	for _, key := range []string{EnvKey, "LC_ALL", "LANG", "LANGUAGE"} {
+		if v := os.Getenv(key); v != "" {
+			if l := ParseLang(v); l != "" {
+				return l
+			}
+		}
+	}
+	return DefaultLang
+}
+
+// ParseLang 解析语言字符串（如 "zh_CN.UTF-8"、"en"）。
+// 无法识别时返回空字符串。
+func ParseLang(v string) Lang {
+	v = strings.ToLower(strings.TrimSpace(v))
 	switch {
-	case strings.HasPrefix(lang, "zh"):
+	case strings.HasPrefix(v, "zh"):
 		return Zh
-	case lang == "" || lang == "c" || lang == "posix":
-		return DefaultLang
-	default:
+	case strings.HasPrefix(v, "en"):
 		return En
+	default:
+		return ""
 	}
 }
 
@@ -111,12 +131,17 @@ var messages = map[Lang]map[string]string{
 		"app.get_help": `使用 "./gyhost help" 获取帮助信息`,
 
 		// ==================== 根帮助 ====================
-		"help.usage":                   "用法:",
-		"help.commands":                "可用模块:",
-		"help.flags":                   "参数:",
+		// 这三个标题与 GYscan/Client 保持一致（中文界面下同样使用英文标题）。
+		"help.usage":                   "Usage:",
+		"help.commands":                "Available Commands:",
+		"help.flags":                   "Flags:",
 		"help.get_cmd_help":            `使用 "gyhost help [模块]" 获取模块帮助信息`,
 		"help.usage_line1":             "  gyhost [help] [flags]",
 		"help.usage_line2":             "  gyhost [command]",
+		"help.group.local.hint":        "提示：CPU / CUDA 自适应",
+		"help.group.net.hint":          "提示：不产生流量",
+		"help.group.mem.hint":          "提示：默认只读",
+		"help.group.proc.hint":         "提示：Linux / macOS",
 		"root.err.unknown_module":      "未知模块: %s",
 		"root.err.unknown_global_flag": "未知的全局参数: %s",
 		"root.err.prefix":              "错误: %v",
@@ -124,6 +149,7 @@ var messages = map[Lang]map[string]string{
 		// ==================== 全局参数 ====================
 		"flag.help":      "显示帮助信息",
 		"flag.version":   "显示版本信息",
+		"flag.lang":      "界面语言: zh(中文) / en(English)，缺省按 GYHOST_LANG/LANG 环境变量",
 		"flag.no_banner": "不显示启动横幅",
 		"flag.no_color":  "禁用颜色输出",
 
@@ -141,7 +167,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== shadow 模块 ====================
 		"shadow.group":        "本地分析",
-		"shadow.summary":      "离线爆破 shadow 文件中的密码哈希",
+		"shadow.summary":      "shadow 文件密码离线爆破",
 		"shadow.flag.input":   "shadow 文件路径",
 		"shadow.flag.dict":    "密码字典路径（与 -m 二选一）",
 		"shadow.flag.mask":    "掩码表达式（hashcat 风格，如 ?l?l?d?d）；与 -p 二选一",
@@ -250,7 +276,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== hashdump 模块 ====================
 		"hashdump.group":      "本地分析",
-		"hashdump.summary":    "从加密压缩包、加密文档或无线抓包中提取可枚举的哈希",
+		"hashdump.summary":    "从加密文件与抓包中提取哈希",
 		"hashdump.flag.input": "压缩包/文档/抓包路径（可重复；给目录时扫描其中的 zip/7z/rar/pdf/cap）",
 		"hashdump.flag.out":   "将提取的哈希写入该文件（默认输出到 stdout）",
 		"hashdump.flag.quiet": "静默模式，不在 stderr 显示统计与提示",
@@ -359,7 +385,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== hashcat 模块 ====================
 		"hashcat.group":      "本地分析",
-		"hashcat.summary":    "识别加密文件与哈希的算法类型，给出对应的 hashcat 模式号",
+		"hashcat.summary":    "识别加密类型与 hashcat 模式",
 		"hashcat.flag.input": "待分析的文件/目录路径（可重复；给目录时扫描其中的压缩包、文档、抓包与哈希清单）",
 		"hashcat.flag.quiet": "静默模式，不显示跳过原因与结尾提示",
 		"hashcat.flag.list":  "列出 GYhost 可识别的算法与对应 hashcat 模式",
@@ -463,7 +489,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== hashac 模块 ====================
 		"hashac.group":   "本地分析",
-		"hashac.summary": "枚举 MD5/WPA2/RAR/ZIP/7z/PDF/office 等常见哈希的明文碰撞",
+		"hashac.summary": "常见哈希明文碰撞",
 		"hashac.usage": `gyhost hashac - 枚举常见哈希的明文碰撞
 
 用法:
@@ -596,7 +622,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== net 模块 ====================
 		"net.group":   "网络分析",
-		"net.summary": "离线分析 pcap/cap 抓包：协议、会话、DNS/TLS/HTTP 与明文安全发现",
+		"net.summary": "离线分析 pcap/cap",
 
 		"net.flag.input":           "抓包文件路径（pcap/pcapng/cap，可重复；给目录时扫描其中的抓包文件）",
 		"net.flag.out":             "把报告写入该文件（默认打印到 stdout）",
@@ -1102,7 +1128,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== mem 模块 ====================
 		"mem.group":   "内存取证",
-		"mem.summary": "内存取证：分析活体进程或内存转储，还原程序行为并从内存中恢复文件",
+		"mem.summary": "内存取证与文件恢复",
 
 		"mem.flag.input":    "分析目标：进程 PID、self（当前进程）或内存转储文件路径",
 		"mem.flag.action":   "要执行的动作，逗号分隔可重复（info/maps/strings/behavior/carve/hash/entropy/dump/all）",
@@ -1420,11 +1446,15 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== Root help ====================
 		"help.usage":                   "Usage:",
-		"help.commands":                "Available Modules:",
+		"help.commands":                "Available Commands:",
 		"help.flags":                   "Flags:",
 		"help.get_cmd_help":            `Use "gyhost help <module>" to get module help`,
 		"help.usage_line1":             "  gyhost [help] [flags]",
 		"help.usage_line2":             "  gyhost [command]",
+		"help.group.local.hint":        "Tip: CPU / CUDA auto-selected",
+		"help.group.net.hint":          "Tip: no traffic generated",
+		"help.group.mem.hint":          "Tip: read-only by default",
+		"help.group.proc.hint":         "Tip: Linux / macOS",
 		"root.err.unknown_module":      "unknown module: %s",
 		"root.err.unknown_global_flag": "unknown global option: %s",
 		"root.err.prefix":              "error: %v",
@@ -1432,6 +1462,7 @@ var messages = map[Lang]map[string]string{
 		// ==================== Global flags ====================
 		"flag.help":      "show help",
 		"flag.version":   "show version information",
+		"flag.lang":      "interface language: zh (Chinese) / en (English); defaults to GYHOST_LANG/LANG",
 		"flag.no_banner": "hide the startup banner",
 		"flag.no_color":  "disable colored output",
 
@@ -1449,7 +1480,7 @@ var messages = map[Lang]map[string]string{
 
 		// ==================== shadow module ====================
 		"shadow.group":        "Local Analysis",
-		"shadow.summary":      "Offline password cracking for shadow files",
+		"shadow.summary":      "Offline shadow password cracking",
 		"shadow.flag.input":   "path to the shadow file",
 		"shadow.flag.dict":    "path to the password wordlist (mutually exclusive with -m)",
 		"shadow.flag.mask":    "mask expression (hashcat style, e.g. ?l?l?d?d); mutually exclusive with -p",
@@ -1559,7 +1590,7 @@ Examples:
 
 		// ==================== hashdump module ====================
 		"hashdump.group":      "Local Analysis",
-		"hashdump.summary":    "Extract crackable hashes from encrypted archives, documents and wireless captures",
+		"hashdump.summary":    "Extract hashes from encrypted files and captures",
 		"hashdump.flag.input": "path to the archive/document/capture (repeatable; a directory scans its zip/7z/rar/pdf/cap files)",
 		"hashdump.flag.out":   "write the extracted hashes to this file (default: stdout)",
 		"hashdump.flag.quiet": "quiet mode, hide summary and notices on stderr",
@@ -1671,7 +1702,7 @@ Examples:
 
 		// ==================== hashcat module ====================
 		"hashcat.group":      "Local Analysis",
-		"hashcat.summary":    "Identify the algorithm behind encrypted files and hashes, with the matching hashcat mode",
+		"hashcat.summary":    "Identify encryption types and hashcat modes",
 		"hashcat.flag.input": "path to the file/directory to analyze (repeatable; a directory scans its archives, documents, captures and hash lists)",
 		"hashcat.flag.quiet": "quiet mode, hide skip reasons and the trailing hint",
 		"hashcat.flag.list":  "list the algorithms GYhost can identify with their hashcat modes",
@@ -1776,7 +1807,7 @@ Examples:
 
 		// ==================== hashac module ====================
 		"hashac.group":   "Local Analysis",
-		"hashac.summary": "Enumerate plaintext collisions for common hashes (MD5/WPA2/RAR/ZIP/7z/PDF/Office)",
+		"hashac.summary": "Plaintext collision for common hashes",
 		"hashac.usage": `gyhost hashac - enumerate plaintext collisions for common hashes
 
 Usage:
@@ -1909,7 +1940,7 @@ Examples:
 
 		// ==================== net module ====================
 		"net.group":   "Network Analysis",
-		"net.summary": "Offline analysis of pcap/cap captures: protocols, conversations, DNS/TLS/HTTP and cleartext findings",
+		"net.summary": "Offline pcap/cap analysis",
 
 		"net.flag.input":           "capture file path (pcap/pcapng/cap, repeatable; a directory scans for capture files)",
 		"net.flag.out":             "write the report to this file (default: print to stdout)",
@@ -2418,7 +2449,7 @@ examples:
 
 		// ==================== mem module ====================
 		"mem.group":   "Memory Forensics",
-		"mem.summary": "Memory forensics: analyze a live process or a memory dump, recover program behavior and carve files out of memory",
+		"mem.summary": "Memory forensics and file carving",
 
 		"mem.flag.input":    "analysis target: process PID, self (current process), or path to a memory dump file",
 		"mem.flag.action":   "actions to run, comma separated and repeatable (info/maps/strings/behavior/carve/hash/entropy/dump/all)",

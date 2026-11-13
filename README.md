@@ -742,7 +742,8 @@ sudo ./gyhost hashac -i hashes.txt -p wordlist.txt --gpu -o cracked.txt   # GPU 
 ./gyhost mem -i memdump.raw -a strings -k password   # 只看含 password 的串
 ```
 
-全局参数：`--help`、`--version`、`--no-banner`、`--no-color`。
+全局参数：`--help`、`--version`（`-V`）、`--lang zh|en`、`--no-banner`、`--no-color`。
+界面语言缺省按 `GYHOST_LANG` / `LC_ALL` / `LANG` / `LANGUAGE` 探测。
 
 ## 项目结构
 
